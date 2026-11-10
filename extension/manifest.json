@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "smart-cdp",
   "description": "Lets smart-cdp probes drive the one tab they open in this profile, through chrome.debugger, without Chrome's remote debugging prompt.",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "permissions": ["debugger"],
   "host_permissions": ["http://127.0.0.1/*"],
   "background": {

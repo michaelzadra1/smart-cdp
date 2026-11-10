@@ -104,8 +104,8 @@ closed: a session name keeps its profile.
 
 Chrome brings the new tab to the front. For work that runs beside the page
 the user is on, add `--background` to the claiming probe: the extension then
-reactivates the tab they used last in that window, or, when Chrome gave the
-tab a window of its own, sends that window behind theirs. Chrome need not
+moves the tab, behind the tab they used last, into that tab's window, and
+Chrome closes the window it had opened for it. Chrome need not
 deliver `Input.*` to a background tab, so press with page events
 (`mousedown`, `mouseup`, `click`) and turn on
 `Emulation.setFocusEmulationEnabled` there.

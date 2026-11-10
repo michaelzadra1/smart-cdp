@@ -75,10 +75,9 @@ test("heartbeats and debugger events cannot send on a closing or closed WebSocke
   expect(sends).toBe(2);
 });
 
-test("a background claim gives focus back to the tab or window the user used last", async () => {
+test("a background claim tucks the tab behind the one the user used last", async () => {
   const secret = "s";
-  const activated: number[] = [];
-  const sentBehind: number[] = [];
+  const calls: unknown[] = [];
   let onUpdated: (tab: number, change: { url: string }) => void = () => {};
   type Handler = (event?: { data: string }) => Promise<void> | void;
   const sockets: { onopen?: Handler; onmessage?: Handler; sent: string[] }[] =
@@ -105,22 +104,21 @@ test("a background claim gives focus back to the tab or window the user used las
         },
       },
       onRemoved: event(),
-      // Tab 8 opened in a new window of its own; the others share window 7.
-      get: async (id: number) => ({ id, windowId: id === 8 ? 9 : 7 }),
-      query: async ({ windowId }: { windowId: number }) =>
-        windowId === 9
-          ? [{ id: 8, lastAccessed: 2000 }]
-          : [
-              { id: 2, lastAccessed: 300 },
-              { id: 3, lastAccessed: 900 },
-              { id: 4, lastAccessed: 100 },
-              { id: 5, lastAccessed: 1000 },
-            ],
-      update: async (id: number) => activated.push(id),
-    },
-    windows: {
-      update: async (id: number, { focused }: { focused: boolean }) =>
-        focused || sentBehind.push(id),
+      // The user's tabs share window 7. Chrome opened the run tab (8) alone
+      // in a new window and activated it, so it is the newest.
+      query: async ({ windowType }: { windowType: string }) => {
+        expect(windowType).toBe("normal");
+        return [
+          { id: 2, windowId: 7, lastAccessed: 300 },
+          { id: 3, windowId: 7, lastAccessed: 900 },
+          { id: 4, windowId: 7, lastAccessed: 100 },
+          { id: 8, windowId: 9, lastAccessed: 2000 },
+        ];
+      },
+      move: async (id: number, to: { windowId: number; index: number }) =>
+        calls.push(["move", id, to]),
+      update: async (id: number, change: { active: boolean }) =>
+        calls.push(["update", id, change]),
     },
     debugger: {
       onEvent: event(),
@@ -141,11 +139,9 @@ test("a background claim gives focus back to the tab or window the user used las
       clearInterval: () => {},
     }
   );
-  // The newest tab, 5, is the run tab itself: Chrome just activated it.
   for (const [tabId, background] of [
-    [5, true],
-    [6, false],
     [8, true],
+    [6, false],
   ] as const) {
     const id = `00000000-0000-4000-8000-00000000000${tabId}`;
     onUpdated(tabId, { url: `http://127.0.0.1:9/smart-cdp/${id}` });
@@ -159,6 +155,8 @@ test("a background claim gives focus back to the tab or window the user used las
       data: JSON.stringify({ type: "proof", proof, background }),
     });
   }
-  expect(activated).toEqual([3]);
-  expect(sentBehind).toEqual([9]);
+  expect(calls).toEqual([
+    ["move", 8, { windowId: 7, index: -1 }],
+    ["update", 3, { active: true }],
+  ]);
 });

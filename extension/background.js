@@ -33,18 +33,17 @@ async function hmac(message) {
     .join("");
 }
 
-// Chrome brings a tab opened from its command line to the front, in an
-// existing window or a new one of its own. Reactivate the tab the user used
-// last in that window, or send a window of its own behind the user's.
+// Chrome brings a tab opened from its command line to the front, often in a
+// new window of its own. Move it into the window of the tab the user used
+// last (a window it empties closes) and reactivate that tab. macOS Chrome
+// cannot send a window behind (windows.update focused: false).
 async function restoreFocus(tabId) {
-  const { windowId } = await chrome.tabs.get(tabId);
-  const [previous] = (await chrome.tabs.query({ windowId }))
+  const [previous] = (await chrome.tabs.query({ windowType: "normal" }))
     .filter((tab) => tab.id !== tabId)
     .sort((a, b) => b.lastAccessed - a.lastAccessed);
-  await (previous
-    ? chrome.tabs.update(previous.id, { active: true })
-    : chrome.windows.update(windowId, { focused: false })
-  ).catch(() => {});
+  if (!previous) return;
+  await chrome.tabs.move(tabId, { windowId: previous.windowId, index: -1 });
+  await chrome.tabs.update(previous.id, { active: true });
 }
 
 function start(tabId, url) {
@@ -89,7 +88,8 @@ function start(tabId, url) {
     if (message.type === "proof") {
       if (message.proof !== (await hmac(`${challenge}:${id}`)))
         return run.stop();
-      if (message.background) await restoreFocus(tabId);
+      // Losing focus is better than losing the tab: never let this block it.
+      if (message.background) await restoreFocus(tabId).catch(() => {});
       return attach();
     }
     if (message.type === "reset") {
