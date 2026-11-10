@@ -5,7 +5,7 @@ import type { Evaluate, Send } from "./probe";
 // Turnstile widget (a site-embedded one or a managed-challenge
 // interstitial's), or null. The widget's checkbox sits about 30px from the
 // widget box's left edge, vertically centered.
-function turnstileCheckboxPoint() {
+export function turnstileCheckboxPointInPage() {
   const candidates: { box: Element; x: number; y: number }[] = [];
   // Standard widgets embed a hidden response input inside the widget box;
   // this also holds for the managed-challenge interstitial. Its parent div
@@ -55,7 +55,7 @@ export async function clickTurnstileCheckbox({
   send: Send;
   evaluate: Evaluate;
 }): Promise<boolean> {
-  const point = await evaluate(turnstileCheckboxPoint);
+  const point = await evaluate(turnstileCheckboxPointInPage);
   if (!point) return false;
   // Land near the measured point instead of on it every time, like the
   // published pure-CDP Turnstile solvers do.

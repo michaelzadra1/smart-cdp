@@ -8,7 +8,7 @@
     "lint": "biome lint .",
     "format": "biome check --write . --unsafe",
     "typecheck": "bun check",
-    "test": "bun test --timeout 30000"
+    "test": "bun test --only-failures --timeout 30000 --concurrent"
   },
   "dependencies": {
     "devtools-protocol": "0.0.1173815"

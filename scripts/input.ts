@@ -21,12 +21,12 @@ export async function pressAt(send: Send, { x, y }: Point) {
   await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...button });
 }
 
-// Page function: the center of the element `find` returns, scrolled into
-// view, if it has a size and is topmost there; otherwise why not.
-export function clickPoint(
+// In page: the center of the element `find` returns, scrolled into view, if
+// it has a size, holds still and is topmost there; otherwise why not.
+export async function clickPointInPage(
   find: (...args: unknown[]) => unknown,
   args: unknown[]
-): Point | { miss: string } {
+): Promise<Point | { miss: string }> {
   const element = find(...args);
   if (!(element instanceof Element)) return { miss: "matched no element" };
   let rect = element.getBoundingClientRect();
@@ -40,6 +40,24 @@ export function clickPoint(
   ) {
     element.scrollIntoView({ block: "center", inline: "center" });
     rect = element.getBoundingClientRect();
+  }
+  // The box must hold still across two animation frames, so a press cannot
+  // land on something still moving. Waiting for frames also proves the page
+  // is painting: Chrome routes a press by what the page last painted, and
+  // drops one that comes before the first paint. A hidden tab paints
+  // nothing, yet takes input.
+  if (document.visibilityState === "visible") {
+    await new Promise((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    );
+    const moved = element.getBoundingClientRect();
+    if (
+      moved.x !== rect.x ||
+      moved.y !== rect.y ||
+      moved.width !== rect.width ||
+      moved.height !== rect.height
+    )
+      return { miss: "is still moving" };
   }
   const x = rect.x + rect.width / 2;
   const y = rect.y + rect.height / 2;
@@ -136,8 +154,8 @@ export async function press(send: Send, key: string) {
 export async function type(send: Send, text: string) {
   for (const char of text) {
     const known = char === "\n" ? keyOf("Enter") : keyOf(char);
-    // Like Puppeteer, a character with no key on the layout is inserted as
-    // text: the page sees input events but no keydown.
+    // A character with no key on the layout is inserted as text: the page
+    // sees input events but no keydown.
     if (known) await stroke(send, known);
     else await send("Input.insertText", { text: char });
     await pause(30, 70);

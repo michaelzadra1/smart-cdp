@@ -22,7 +22,8 @@ import {
   launchChrome,
   stopChrome,
 } from "./chrome";
-import { clickPoint, type Point, press, pressAt, type } from "./input";
+import { inPageCall, returnByValueInPage } from "./in-page";
+import { clickPointInPage, type Point, press, pressAt, type } from "./input";
 import { clickRecaptchaCheckbox } from "./recaptcha";
 import type { RelayConfig, RelayState, RelayStatus } from "./relay";
 import { clickTurnstileCheckbox } from "./turnstile";
@@ -69,14 +70,13 @@ export type ProbeContext = {
   clickTurnstileCheckbox: () => Promise<boolean>;
 };
 
-export type Probe = (context: ProbeContext) => Promise<unknown>;
+export type Probe<T = unknown> = (context: ProbeContext) => Promise<T>;
 
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
 
-// A DOM node cannot leave the page by value: Chrome returns {} for most and
-// fails on one with cyclic expandos, such as a React-rendered element.
+// What returnByValueInPage sends back for a DOM node.
 const NODE_MARK = "smart-cdp:returned-node";
 class ReturnedNodeError extends Error {
   override message =
@@ -544,10 +544,11 @@ const errorText = (error: unknown) =>
 const navigated =
   /navigated or closed|context was destroyed|Cannot find (default execution )?context/;
 
-export async function runProbe(
+/** Runs a typed probe, or stdin code (the CLI's only), in the browser. */
+export async function runProbe<T = unknown>(
   options: ProbeOptions,
-  snippet: string | Probe
-): Promise<unknown> {
+  snippet: string | Probe<T>
+): Promise<T> {
   let chrome: Chrome | undefined;
   let session: RelayState | undefined;
   let cdp: CdpClient | undefined;
@@ -692,8 +693,12 @@ export async function runProbe(
       await send("Page.enable");
     }
     const call = (fn: (...args: never[]) => unknown, args: unknown[]) =>
-      `(async () => { const value = await (${fn})(...${JSON.stringify(args)}); ` +
-      `return value instanceof Node ? ${JSON.stringify(NODE_MARK)} : value; })()`;
+      inPageCall(
+        returnByValueInPage,
+        fn as (...args: unknown[]) => unknown,
+        args,
+        NODE_MARK
+      );
     const evaluateOnce = async (expression: string) => {
       const result = await send("Runtime.evaluate", {
         expression,
@@ -724,7 +729,7 @@ export async function runProbe(
       const url =
         targetInfos.find((target) => target.targetId === targetId)?.url ??
         (await Promise.race([
-          evaluateOnce("location.href").catch(() => null),
+          evaluateOnce(call(() => location.href, [])).catch(() => null),
           delay(2000, null, { ref: false }),
         ]));
       return typeof url === "string" ? url : "a closed page";
@@ -804,7 +809,11 @@ export async function runProbe(
           : [target, options.args ?? [], "the element"];
       const point = await poll(
         "click",
-        `(${clickPoint})((${find}), ${JSON.stringify(args)})`,
+        inPageCall(
+          clickPointInPage,
+          find as (...args: unknown[]) => unknown,
+          args
+        ),
         options,
         (value) => typeof value === "object" && value !== null && "x" in value,
         (last, error) =>
@@ -832,7 +841,7 @@ export async function runProbe(
           new AsyncFunction(`{ ${Object.keys(context)} }`, `{\n${snippet}\n}`)
         : snippet;
     try {
-      return await run(context);
+      return (await run(context)) as T;
     } finally {
       if (!personal)
         await client.Target.detachFromTarget({ sessionId }).catch(() => {});
