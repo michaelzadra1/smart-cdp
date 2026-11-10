@@ -24,6 +24,7 @@ import {
 } from "./chrome";
 import { inPageCall, returnByValueInPage } from "./in-page";
 import { clickPointInPage, type Point, press, pressAt, type } from "./input";
+import { holdPressAndHoldButton, type PressAndHoldResult } from "./press-hold";
 import { clickRecaptchaCheckbox } from "./recaptcha";
 import type { RelayConfig, RelayState, RelayStatus } from "./relay";
 import { clickTurnstileCheckbox } from "./turnstile";
@@ -68,6 +69,7 @@ export type ProbeContext = {
   press: (key: string) => Promise<void>;
   clickRecaptchaCheckbox: () => Promise<boolean>;
   clickTurnstileCheckbox: () => Promise<boolean>;
+  holdPressAndHoldButton: () => Promise<PressAndHoldResult | false>;
 };
 
 export type Probe<T = unknown> = (context: ProbeContext) => Promise<T>;
@@ -117,7 +119,7 @@ CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
 Context: { cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press,
-  clickRecaptchaCheckbox, clickTurnstileCheckbox }
+  clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
@@ -836,6 +838,7 @@ export async function runProbe<T = unknown>(
       press: (key) => press(send, key),
       clickRecaptchaCheckbox: () => clickRecaptchaCheckbox({ send, evaluate }),
       clickTurnstileCheckbox: () => clickTurnstileCheckbox({ send, evaluate }),
+      holdPressAndHoldButton: () => holdPressAndHoldButton({ send }),
     };
     const run =
       typeof snippet === "string"

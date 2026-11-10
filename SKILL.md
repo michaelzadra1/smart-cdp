@@ -57,7 +57,7 @@ when comparing scraper behavior.
 Pass an async JavaScript function body on stdin, or `--file /path/probe.ts`
 with a default-exported async function receiving the same context (type it with
 `ProbeContext` from `scripts/probe.ts`, whose `send` is typed per CDP method). The context is
-`{ cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press, clickRecaptchaCheckbox, clickTurnstileCheckbox }`.
+`{ cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press, clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }`.
 Results go to stdout as JSON; diagnostics go to stderr. The default deadline is 120 seconds.
 An unhandled rejection in probe code is logged and the probe carries on. At
 shutdown, stderr lists any command Chrome never answered. A "Leave site?" dialog
@@ -189,8 +189,9 @@ bodies, screenshots, and child-target and popup recipes. Read
 [LIFECYCLE.md](references/LIFECYCLE.md) for authorized attachment, cleanup,
 or cold rotation. Read [STEALTH.md](references/STEALTH.md) for instrumentation
 and anti-bot evidence, [CAPTCHA.md](references/CAPTCHA.md) for a visible
-challenge (`clickRecaptchaCheckbox()` handles the reCAPTCHA checkbox and
-`clickTurnstileCheckbox()` the Cloudflare Turnstile widget), and
+challenge (`clickRecaptchaCheckbox()` handles the reCAPTCHA checkbox,
+`clickTurnstileCheckbox()` the Cloudflare Turnstile widget, and
+`holdPressAndHoldButton()` the HUMAN/PerimeterX Press & Hold button), and
 [DIAGNOSIS.md](references/DIAGNOSIS.md) to classify a failure or compare a
 working path with a failing one. Read
 [THROUGHPUT.md](references/THROUGHPUT.md) before building or tuning anything
