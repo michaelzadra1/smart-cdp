@@ -41,24 +41,6 @@ export async function clickPointInPage(
     element.scrollIntoView({ block: "center", inline: "center" });
     rect = element.getBoundingClientRect();
   }
-  // The box must hold still across two animation frames, so a press cannot
-  // land on something still moving. Waiting for frames also proves the page
-  // is painting: Chrome routes a press by what the page last painted, and
-  // drops one that comes before the first paint. A hidden tab paints
-  // nothing, yet takes input.
-  if (document.visibilityState === "visible") {
-    await new Promise((resolve) =>
-      requestAnimationFrame(() => requestAnimationFrame(resolve))
-    );
-    const moved = element.getBoundingClientRect();
-    if (
-      moved.x !== rect.x ||
-      moved.y !== rect.y ||
-      moved.width !== rect.width ||
-      moved.height !== rect.height
-    )
-      return { miss: "is still moving" };
-  }
   const x = rect.x + rect.width / 2;
   const y = rect.y + rect.height / 2;
   // Inside a shadow root, the document reports only the shadow host.
@@ -75,6 +57,20 @@ export async function clickPointInPage(
         : ""
     }`;
     return { miss: `is covered by <${name.slice(0, 80)}>` };
+  }
+  // Two animation frames with the box unmoved: the press cannot land on
+  // something in motion, and the page is painting, which matters because
+  // Chrome drops a press that comes before the first paint. A hidden tab
+  // paints nothing, yet takes input.
+  if (document.visibilityState === "visible") {
+    const painted = await new Promise<boolean>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+      setTimeout(() => resolve(false), 200);
+    });
+    if (!painted) return { miss: "is on a page that is not painting" };
+    const now = element.getBoundingClientRect();
+    if (JSON.stringify(now) !== JSON.stringify(rect))
+      return { miss: "is still moving" };
   }
   return { x, y };
 }

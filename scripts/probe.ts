@@ -76,8 +76,6 @@ const SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
 
-// What returnByValueInPage sends back for a DOM node.
-const NODE_MARK = "smart-cdp:returned-node";
 class ReturnedNodeError extends Error {
   override message =
     "The page function returned a DOM element, which cannot leave the page: return its text or attributes, or a boolean such as !!document.querySelector(...)";
@@ -692,13 +690,6 @@ export async function runProbe<T = unknown>(
       );
       await send("Page.enable");
     }
-    const call = (fn: (...args: never[]) => unknown, args: unknown[]) =>
-      inPageCall(
-        returnByValueInPage,
-        fn as (...args: unknown[]) => unknown,
-        args,
-        NODE_MARK
-      );
     const evaluateOnce = async (expression: string) => {
       const result = await send("Runtime.evaluate", {
         expression,
@@ -710,11 +701,20 @@ export async function runProbe<T = unknown>(
           result.exceptionDetails.exception?.description ??
             result.exceptionDetails.text
         );
-      if (result.result.value === NODE_MARK) throw new ReturnedNodeError();
       return result.result.value;
     };
+    const evaluateValue = async <A extends unknown[]>(
+      fn: (...args: A) => unknown,
+      args: A
+    ) => {
+      const result = await evaluateOnce(
+        inPageCall(returnByValueInPage, fn, args)
+      );
+      if (result.node) throw new ReturnedNodeError();
+      return result.value;
+    };
     const evaluate: Evaluate = (fn, ...args) =>
-      evaluateOnce(call(fn, args)).catch((error: Error) => {
+      evaluateValue(fn, args).catch((error: Error) => {
         if (error instanceof CdpProtocolError && navigated.test(error.message))
           error.message +=
             ". The page navigated while evaluate ran; wait for the new page with waitFor()";
@@ -729,18 +729,18 @@ export async function runProbe<T = unknown>(
       const url =
         targetInfos.find((target) => target.targetId === targetId)?.url ??
         (await Promise.race([
-          evaluateOnce(call(() => location.href, [])).catch(() => null),
+          evaluate(() => location.href).catch(() => null),
           delay(2000, null, { ref: false }),
         ]));
       return typeof url === "string" ? url : "a closed page";
     };
     // Polls from the host with short evaluations: a redirect or reload between
     // polls costs one retry, where one long in-page wait fails outright.
-    // Resolves with the first value `done` accepts; on timeout, `explain`
-    // words the last value or page error.
+    // Resolves with the first value of `attempt` that `done` accepts; on
+    // timeout, `explain` words the last value or page error.
     const poll = async (
       name: string,
-      expression: string,
+      evaluateAttempt: () => Promise<unknown>,
       options: PollOptions<unknown[]>,
       done: (value: unknown) => boolean,
       explain: (last: unknown, lastError?: string) => string
@@ -758,7 +758,7 @@ export async function runProbe<T = unknown>(
       let last: unknown;
       let lastError: Error | undefined;
       for (;;) {
-        const attempt = evaluateOnce(expression);
+        const attempt = evaluateAttempt();
         attempt.catch(() => {});
         try {
           const remaining = Math.max(deadline - Date.now(), 0);
@@ -793,7 +793,7 @@ export async function runProbe<T = unknown>(
     const waitFor: WaitFor = (fn, options = {}) =>
       poll(
         "waitFor",
-        call(fn, options.args ?? []),
+        () => evaluateValue(fn, options.args ?? ([] as never)),
         options,
         Boolean,
         (_, error) => (error ? `; last error: ${error}` : "")
@@ -809,11 +809,14 @@ export async function runProbe<T = unknown>(
           : [target, options.args ?? [], "the element"];
       const point = await poll(
         "click",
-        inPageCall(
-          clickPointInPage,
-          find as (...args: unknown[]) => unknown,
-          args
-        ),
+        () =>
+          evaluateOnce(
+            inPageCall(
+              clickPointInPage,
+              find as (...args: unknown[]) => unknown,
+              args
+            )
+          ),
         options,
         (value) => typeof value === "object" && value !== null && "x" in value,
         (last, error) =>

@@ -1,30 +1,40 @@
 import { expect, test } from "bun:test";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { returnByValueInPage } from "./in-page";
-import { clickPointInPage } from "./input";
-import { recaptchaCheckboxPointInPage } from "./recaptcha";
-import { turnstileCheckboxPointInPage } from "./turnstile";
 
 // Rules for the code in scripts/ that a scan can check; AGENTS.md states them.
 const sources = await Promise.all(
   (await readdir(import.meta.dir))
-    .filter((file) => file.endsWith(".ts"))
+    .filter((file) => file.endsWith(".ts") && file !== "source-rules.test.ts")
     .map(async (file) => ({
       file,
       source: await readFile(join(import.meta.dir, file), "utf8"),
     }))
 );
 
-// Every program that ships to Chrome's renderer as toString() output. A free
-// variable in one compiles here and fails only when the page calls it, so the
-// real-Chrome tests in probe.test.ts call each of them too.
-const IN_PAGE_PROGRAMS: Record<string, (...args: never[]) => unknown> = {
-  returnByValueInPage,
-  clickPointInPage,
-  recaptchaCheckboxPointInPage,
-  turnstileCheckboxPointInPage,
-};
+// Every program that ships to Chrome's renderer as toString() output: each
+// `*InPage` export. Found by scanning exports, so a new one cannot skip the
+// guard, and imported only from modules that have one, since some modules
+// run as scripts. A free variable in a program compiles here and fails only
+// when the page calls it, so the real-Chrome tests call each of them too.
+const transpiler = new Bun.Transpiler({ loader: "ts" });
+const inPagePrograms = (
+  await Promise.all(
+    sources
+      .filter(({ file }) => !file.includes(".test."))
+      .map(async ({ file, source }) => {
+        const names = transpiler
+          .scan(source)
+          .exports.filter((name) => name.endsWith("InPage"));
+        if (!names.length) return [];
+        const module = await import(join(import.meta.dir, file));
+        return names.map(
+          (name) =>
+            [name, module[name] as (...args: never[]) => unknown] as const
+        );
+      })
+  )
+).flat();
 
 // SCREAMING_SNAKE names the source uses but never declares: a module-scope
 // constant, the one self-containment slip that type checking cannot see,
@@ -47,41 +57,29 @@ function freeModuleConstants(source: string) {
   return [...new Set(used.filter((name) => !declared.has(name)))];
 }
 
-test("in-page programs are self-contained and all registered", async () => {
+test("in-page programs are self-contained", () => {
+  expect(inPagePrograms.length).toBeGreaterThan(0);
   const offenders: Record<string, string[]> = {};
-  for (const [name, fn] of Object.entries(IN_PAGE_PROGRAMS)) {
+  for (const [name, fn] of inPagePrograms) {
     const free = freeModuleConstants(fn.toString());
     if (free.length) offenders[name] = free;
-    // new Function compiles with a global-only scope chain, as the page does.
+    // new Function compiles with a global-only scope chain, as the page does;
+    // a serialized method shorthand, for one, does not parse there.
     expect(() => new Function(`return (${fn})`)(), name).not.toThrow();
   }
   expect(offenders).toEqual({});
-
-  // Scanned off disk, so a new module cannot skip the guard by not being
-  // imported here.
-  const exported: string[] = [];
-  for (const { file, source } of sources) {
-    if (file.includes(".test.")) continue;
-    for (const match of source.matchAll(
-      /^export (?:async )?function (\w*InPage)\b/gm
-    ))
-      exported.push(match[1] as string);
-  }
-  expect(exported.sort()).toEqual(Object.keys(IN_PAGE_PROGRAMS).sort());
 });
 
 test("no code or test takes the user's focus from a launched Chrome", () => {
-  // Both make Chrome the frontmost app (SKILL.md, Boundaries).
-  const offenders = sources.flatMap(({ file, source }) =>
-    [...source.matchAll(/activateTarget|createTarget/g)]
-      .filter(
-        (match) =>
-          match[0] === "activateTarget" ||
-          !/background: true/.test(source.slice(match.index, match.index + 200))
-      )
-      .map((match) => `${file}: ${match[0]}`)
-  );
-  expect(offenders.filter((line) => !line.startsWith("source-rules."))).toEqual(
-    []
-  );
+  // The CDP client opens new tabs in the background (cdp.ts); these are the
+  // explicit ways to make Chrome the frontmost app (SKILL.md, Boundaries).
+  // cdp.test.ts sends its background: false to a fake server, not Chrome.
+  const offenders = sources
+    .filter(({ file }) => file !== "cdp.test.ts")
+    .flatMap(({ file, source }) =>
+      [
+        ...source.matchAll(/activateTarget|bringToFront|background: false/g),
+      ].map((match) => `${file}: ${match[0]}`)
+    );
+  expect(offenders).toEqual([]);
 });
