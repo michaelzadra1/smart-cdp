@@ -1,8 +1,9 @@
+import { pressAt } from "./input";
 import type { Evaluate, Send } from "./probe";
 
 // Page function: the checkbox point of a visible, uncovered, normal-size
 // (304x78) reCAPTCHA anchor widget, or null.
-function recaptchaCheckboxPoint() {
+export function recaptchaCheckboxPointInPage() {
   for (const frame of document.querySelectorAll("iframe")) {
     if (
       !/^https:\/\/(?:www\.google\.com|www\.recaptcha\.net)\/recaptcha\/(?:api2|enterprise)\/anchor\?/.test(
@@ -28,11 +29,8 @@ export async function clickRecaptchaCheckbox({
   send: Send;
   evaluate: Evaluate;
 }): Promise<boolean> {
-  const point = await evaluate(recaptchaCheckboxPoint);
+  const point = await evaluate(recaptchaCheckboxPointInPage);
   if (!point) return false;
-  const click = { ...point, button: "left", clickCount: 1 } as const;
-  await send("Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
-  await send("Input.dispatchMouseEvent", { type: "mousePressed", ...click });
-  await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...click });
+  await pressAt(send, point);
   return true;
 }

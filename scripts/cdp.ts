@@ -123,6 +123,10 @@ class Connection {
       return Promise.reject(
         new CdpConnectionClosedError(`CDP connection closed before ${method}`)
       );
+    // Chrome's own default opens a new tab in front, taking the user's focus
+    // (SKILL.md, Boundaries); a caller that wants that passes false.
+    if (method === "Target.createTarget")
+      params = { background: true, ...params };
     const id = this.nextId++;
     const label = sessionId ? `${method} (session ${sessionId})` : method;
     const { promise, resolve, reject } = Promise.withResolvers<unknown>();

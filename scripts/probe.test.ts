@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import type { EventEmitter } from "node:events";
 import {
   access,
   chmod,
@@ -16,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServerWebSocket } from "bun";
+import type { CdpClient } from "./cdp";
 import {
   activePortEndpoint,
   isAlive as alive,
@@ -23,6 +23,7 @@ import {
   relayStatePath,
   runProbe,
   sessionStatePath,
+  type WaitFor,
   waitForExit,
 } from "./probe";
 
@@ -65,10 +66,34 @@ async function expectCleaned(result: { stderr: string }) {
   expect(await exists(profile)).toBe(false);
 }
 
+const message = (error: Error) => error.message;
+
+const pageLoaded = (cdp: CdpClient, sessionId: string) =>
+  new Promise((resolve) =>
+    cdp.once(`Page.loadEventFired.${sessionId}`, resolve)
+  );
+
 async function serve(handler: Parameters<typeof createServer>[1]) {
   const server = createServer(handler);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return server;
+}
+
+// A click into a fresh cross-origin frame can miss (see CAPTCHA.md), so
+// click until the frame reports the press.
+async function clickUntilLanded(
+  click: () => Promise<boolean>,
+  waitFor: WaitFor
+) {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    if (!(await click())) return { clicked: false, title: "" };
+    const title = await waitFor(() => document.title, {
+      timeoutMs: 200,
+      intervalMs: 50,
+    }).catch(() => "");
+    if (title || Date.now() >= deadline) return { clicked: true, title };
+  }
 }
 
 const portOf = (server: Server) => (server.address() as AddressInfo).port;
@@ -142,18 +167,13 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       await loaded;
       return await evaluate(suffix => ({ title: document.title, text: document.querySelector("h1").textContent + suffix, webdriver: navigator.webdriver }), "!");
     `,
-        ["--once", "--headless"]
+        ["--once"]
       ),
       cli(
         'return await evaluate(() => { throw new Error("page failure"); });',
-        ["--once", "--headless"]
+        ["--once"]
       ),
-      cli("await new Promise(() => {});", [
-        "--once",
-        "--headless",
-        "--timeout-ms",
-        "2000",
-      ]),
+      cli("await new Promise(() => {});", ["--once", "--timeout-ms", "2000"]),
       // Like an attach listener awaiting a command on a paused popup: closing
       // Chrome rejects it, which used to crash cleanup and lose the result.
       cli(
@@ -162,7 +182,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       Promise.reject(new Error("listener failure"));
       return "kept";
     `,
-        ["--once", "--headless"]
+        ["--once"]
       ),
       cli(
         `
@@ -170,7 +190,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       process.kill(processInfo.find(p => p.type === "browser").id, "SIGKILL");
       await new Promise(() => {});
     `,
-        ["--once", "--headless", "--timeout-ms", "20000"]
+        ["--once", "--timeout-ms", "20000"]
       ),
     ]);
     expect(success.status, success.stderr).toBe(0);
@@ -214,7 +234,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
           await loaded;
           ${body}
         `,
-          ["--once", "--headless", "--profile", profile]
+          ["--once", "--profile", profile]
         );
       const signIn = await visit(
         'return await evaluate(() => { document.cookie = "session=1; max-age=3600"; return true; });'
@@ -233,7 +253,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
     let relayPid = 0;
     let proxied = "";
     await runProbe(
-      parseOptions(["--once", "--headless"]),
+      parseOptions(["--once"]),
       async ({ cdp, targetId, send }) => {
         // Chrome prompts per upstream WebSocket, so count them through a proxy.
         let upstreams = 0;
@@ -359,19 +379,26 @@ test("waitFor survives a page that replaces itself after load", async () => {
   });
   try {
     const hop = `http://127.0.0.1:${portOf(server)}/hop`;
-    const result = await cli(
-      `
-      await send("Page.navigate", { url: ${JSON.stringify(hop)} });
-      const longWait = await evaluate(() => new Promise(r => setTimeout(r, 3000))).catch(e => e.message);
-      await send("Page.navigate", { url: ${JSON.stringify(hop)} });
-      const landed = await waitFor(() => document.title === "Landed" && location.pathname);
-      const timedOut = await waitFor(() => { throw new Error("boom"); }, { timeoutMs: 300 }).catch(e => e.message);
-      return { longWait, landed, timedOut };
-    `,
-      ["--once", "--headless"]
+    const { longWait, landed, timedOut } = await runProbe(
+      parseOptions(["--once"]),
+      async ({ send, evaluate, waitFor }) => {
+        await send("Page.navigate", { url: hop });
+        const longWait = await evaluate(
+          () => new Promise((resolve) => setTimeout(resolve, 3000))
+        ).catch(message);
+        await send("Page.navigate", { url: hop });
+        const landed = await waitFor(
+          () => document.title === "Landed" && location.pathname
+        );
+        const timedOut = await waitFor(
+          () => {
+            throw new Error("boom");
+          },
+          { timeoutMs: 300 }
+        ).catch(message);
+        return { longWait, landed, timedOut };
+      }
     );
-    expect(result.status, result.stderr).toBe(0);
-    const { longWait, landed, timedOut } = JSON.parse(result.stdout);
     expect(longWait).toMatch(
       /navigated or closed\. The page navigated while evaluate ran/
     );
@@ -379,14 +406,13 @@ test("waitFor survives a page that replaces itself after load", async () => {
     expect(timedOut).toMatch(
       /^waitFor timed out after 300ms on http:.*\/landed; last error: Error: boom$/
     );
-    await expectCleaned(result);
   } finally {
     await close(server);
   }
 }, 30000);
 
 test("explains a sandbox that blocks loopback sockets", async () => {
-  const { status, stderr } = await cli("return 1;", ["--headless"], probe, [
+  const { status, stderr } = await cli("return 1;", [], probe, [
     "sandbox-exec",
     "-p",
     "(version 1)(allow default)(deny network*)",
@@ -398,11 +424,13 @@ test("explains a sandbox that blocks loopback sockets", async () => {
 }, 30000);
 
 test("a probe claims a browser by default and keeps it until released", async () => {
+  // The probe declares a name the context also has: stdin code may.
   const claimed = await cli(
-    'await send("Page.navigate", { url: "data:text/html,<title>claimed</title>" }); return 1;',
-    ["--headless"]
+    'const click = "mine"; await send("Page.navigate", { url: "data:text/html,<title>claimed</title>" }); return click;',
+    []
   );
   expect(claimed.status, claimed.stderr).toBe(0);
+  expect(JSON.parse(claimed.stdout)).toBe("mine");
   const [, id, chromePid] =
     /Claimed browser (b-[0-9a-f]{6}): Chrome pid=(\d+)/.exec(claimed.stderr) ??
     [];
@@ -417,7 +445,6 @@ test("a probe claims a browser by default and keeps it until released", async ()
     const next = await cli("return await evaluate(() => document.title);", [
       "--session",
       id ?? "",
-      "--headless",
     ]);
     expect(next.status, next.stderr).toBe(0);
     expect(JSON.parse(next.stdout)).toBe("claimed");
@@ -467,7 +494,8 @@ socket.onmessage = async ({ data }) => {
     : expression.includes("NOT_YET")
       ? null
       : { sessionId: message.sessionId ?? null, resets };
-  send({ id: message.id, result: { result: { type: "object", value } } });
+  // The page's returnByValueInPage wraps every value.
+  send({ id: message.id, result: { result: { type: "object", value: { value } } } });
 };
 `;
 
@@ -612,7 +640,7 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
     res.end(`<title>${req.url}</title>`);
   });
   const name = `test-${process.pid}`;
-  const inSession = ["--session", name, "--headless"];
+  const inSession = ["--session", name];
   try {
     const url = `http://127.0.0.1:${portOf(server)}/kept`;
     const first = await cli(
@@ -659,11 +687,11 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
       page: ["/kept", 2],
     });
 
-    // Leaving out --headless asks for a visible browser; the refusal says how to continue.
-    const visible = await cli("return 1;", ["--session", name]);
-    expect(visible.status).toBe(1);
-    expect(visible.stderr).toMatch(
-      /runs headless Chrome .*To continue in it, pass --headless/
+    // Adding --headless asks for another browser; the refusal says how to continue.
+    const headless = await cli("return 1;", ["--session", name, "--headless"]);
+    expect(headless.status).toBe(1);
+    expect(headless.stderr).toMatch(
+      /runs visible Chrome .*To continue in it, leave out --headless/
     );
 
     const ended = await cli("", ["--end-session", name]);
@@ -721,113 +749,158 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
   }
 }, 60000);
 
-test("clicks only a visible normal-size reCAPTCHA checkbox", async () => {
-  const widget = (extra = "") =>
-    `<iframe src="https://www.google.com/recaptcha/api2/anchor?k=test" ${extra}
-      style="border:0;position:absolute;left:40px;top:60px"></iframe>`;
-  const pages: Record<string, string> = {
-    "/normal": widget('width="304" height="78"'),
-    "/covered": `${widget('width="304" height="78"')}<div style="position:absolute;left:40px;top:60px;width:304px;height:78px"></div>`,
-    "/compact": widget('width="164" height="144"'),
-  };
-  const server = await serve((req, res) => {
+test("click, type and press send trusted input, in a hidden tab too", async () => {
+  // Sites such as payroll apps sign the user out on untrusted (page-script)
+  // events, so the page records every event's isTrusted.
+  const server = await serve((_req, res) => {
     res.setHeader("Content-Type", "text/html");
-    res.end(
-      `${pages[req.url ?? ""]}<script>addEventListener("message", e => { if (e.data === "painted") window.painted = true; else document.title = e.data; })</script>`
-    );
+    res.end(`<button id="year" style="position:absolute;left:40px;top:40px">Year</button>
+      <input id="field" style="position:absolute;left:40px;top:100px">
+      <button id="under" style="position:absolute;left:40px;top:160px">Under</button>
+      <div id="overlay" style="position:absolute;left:30px;top:150px;width:200px;height:50px"></div>
+      <script>
+        window.events = [];
+        for (const type of ["mousemove", "pointerdown", "mousedown", "mouseup", "click", "keydown", "input"])
+          addEventListener(type, (e) => events.push([type, e.isTrusted, e.target.id, e.key ?? null, e.keyCode ?? null, e.shiftKey ?? null]), true);
+        year.onclick = () => setTimeout(() => {
+          const option = document.createElement("div");
+          option.role = "option";
+          option.textContent = "2024";
+          option.style = "position:absolute;left:40px;top:2000px;width:80px;height:20px";
+          option.onclick = () => (document.title = "picked " + option.textContent);
+          document.body.append(option);
+        }, 400);
+      </script>`);
   });
-  // Input reaches a cross-origin frame only after it has painted, which a
-  // visible challenge already has; clicking right after load can miss it.
-  const anchor = Buffer.from(
-    "<script>onmousedown = () => parent.postMessage('clicked', '*');" +
-      "requestAnimationFrame(() => requestAnimationFrame(() => parent.postMessage('painted', '*')))</script>"
-  ).toString("base64");
   try {
-    const results = await runProbe(
-      parseOptions(["--once", "--headless"]),
+    const url = `http://127.0.0.1:${portOf(server)}`;
+    const { clickMs, failures, title, value, events } = await runProbe(
+      parseOptions(["--once"]),
       async ({
         cdp,
         send,
-        sessionId,
+        targetId,
         evaluate,
         waitFor,
-        clickRecaptchaCheckbox,
+        click,
+        type,
+        press,
       }) => {
-        cdp.on("Fetch.requestPaused", ({ requestId }) =>
-          cdp.Fetch.fulfillRequest({
-            requestId,
-            responseCode: 200,
-            responseHeaders: [{ name: "Content-Type", value: "text/html" }],
-            body: anchor,
-          })
-        );
-        await cdp.Fetch.enable({
-          patterns: [{ urlPattern: "https://www.google.com/recaptcha/*" }],
+        await send("Page.navigate", { url });
+        await waitFor(() => document.readyState === "complete");
+        // Hide the tab without taking focus (SKILL.md, Boundaries).
+        const { windowId } = await cdp.Browser.getWindowForTarget({
+          targetId,
         });
-        await send("Page.enable");
-        const results: Record<string, { clicked: boolean; title: string }> = {};
-        for (const path of Object.keys(pages)) {
-          const loaded = new Promise((resolve) =>
-            (cdp as unknown as EventEmitter).once(
-              `Page.loadEventFired.${sessionId}`,
-              resolve
-            )
-          );
-          await send("Page.navigate", {
-            url: `http://127.0.0.1:${portOf(server)}${path}`,
-          });
-          await loaded;
-          await waitFor(
-            () => (window as unknown as { painted?: boolean }).painted
-          );
-          const clicked = await clickRecaptchaCheckbox();
-          const title = await evaluate(
-            (wait: number) =>
-              new Promise<string>((resolve) => {
-                const end = Date.now() + wait;
-                const check = () =>
-                  document.title || Date.now() >= end
-                    ? resolve(document.title)
-                    : setTimeout(check, 50);
-                check();
-              }),
-            clicked ? 1000 : 0
-          );
-          results[path] = { clicked, title };
-        }
-        return results;
+        await cdp.Browser.setWindowBounds({
+          windowId,
+          bounds: { windowState: "minimized" },
+        });
+        await waitFor(() => document.visibilityState === "hidden", {
+          intervalMs: 50,
+        });
+        // A hidden tab holds a mouseMoved for at least 5 seconds, so a click
+        // that waited on one would take that long, however loaded the machine.
+        const started = Date.now();
+        await click("#year", { timeoutMs: 10000 });
+        const clickMs = Date.now() - started;
+        // The option renders 400ms later and below the fold.
+        await click(
+          (text: string) =>
+            [...document.querySelectorAll("[role=option]")].find(
+              (option) => option.textContent === text
+            ),
+          { args: ["2024"], timeoutMs: 10000 }
+        );
+        await click("#field", { timeoutMs: 10000 });
+        await type("Ab1 .");
+        await press("Enter");
+        const failures = await Promise.all(
+          [
+            click("#under", { timeoutMs: 300 }),
+            click("#missing", { timeoutMs: 300 }),
+            press("F13"),
+            // @ts-expect-error stdin probes are not type-checked
+            waitFor(() => true, { timeout: 5000 }),
+            waitFor(() => document.body),
+          ].map((done) => done.then(() => "resolved", message))
+        );
+        const page = await evaluate(() => ({
+          title: document.title,
+          value: document.querySelector<HTMLInputElement>("#field")?.value,
+          events: (window as unknown as { events: unknown[][] }).events,
+        }));
+        return { clickMs, failures, ...page };
       }
     );
-    expect(results).toEqual({
-      "/normal": { clicked: true, title: "clicked" },
-      "/covered": { clicked: false, title: "" },
-      "/compact": { clicked: false, title: "" },
-    });
+    expect(clickMs).toBeLessThan(4000);
+    expect(title).toBe("picked 2024");
+    expect(value).toBe("Ab1 .");
+    expect(events.filter(([, trusted]) => !trusted)).toEqual([]);
+    const on = (id: string) =>
+      events
+        .filter((event) => event[2] === id && event[0] !== "keydown")
+        .map(([type]) => type);
+    // The move a hidden tab holds still arrives, before the press.
+    expect(on("year")).toEqual([
+      "mousemove",
+      "pointerdown",
+      "mousedown",
+      "mouseup",
+      "click",
+    ]);
+    expect(
+      events
+        .filter(([type]) => type === "keydown")
+        .map((event) => event.slice(3))
+    ).toEqual([
+      ["A", 65, true],
+      ["b", 66, false],
+      ["1", 49, false],
+      [" ", 32, false],
+      ["Enter", 13, false],
+    ]);
+    expect(failures[0]).toMatch(
+      /^click timed out after 300ms on http:.*: #under is covered by <div#overlay>$/
+    );
+    expect(failures[1]).toMatch(/: #missing matched no element$/);
+    expect(failures[2]).toMatch(/^press: unknown key "F13"; use a letter/);
+    expect(failures[3]).toBe(
+      "waitFor: unknown option timeout; it takes args, timeoutMs, intervalMs"
+    );
+    expect(failures[4]).toMatch(/^The page function returned a DOM element/);
   } finally {
     await close(server);
   }
 }, 30000);
 
-test("clicks only a visible Cloudflare Turnstile widget", async () => {
-  // A real widget box: the hidden response input's parent div, with the
-  // challenges.cloudflare.com checkbox iframe inside it. A 300x65 box puts
-  // the clickable point at +30px from the left, vertically centered.
-  const widget = (inner: string) =>
-    `<div style="position:absolute;left:40px;top:60px;width:300px;height:65px">
-      <input name="cf-turnstile-response" type="hidden">${inner}</div>`;
-  const frames = {
-    iframe: `<iframe src="https://challenges.cloudflare.com/turnstile/v0/site/test/none/normal/fbE/new/hidden"
-      style="border:0;width:100%;height:100%"></iframe>`,
-  };
+test("clicks only a visible, uncovered reCAPTCHA or Turnstile checkbox", async () => {
+  const recaptcha = (size: string) =>
+    `<iframe src="https://www.google.com/recaptcha/api2/anchor?k=test" ${size}
+      style="border:0;position:absolute;left:40px;top:60px"></iframe>`;
+  const turnstileFrame = (style: string) =>
+    `<iframe src="https://challenges.cloudflare.com/turnstile/v0/site/test/none/normal/fbE/new/hidden"
+      style="border:0;${style}"></iframe>`;
+  // A real Turnstile box: the hidden response input's parent div, with the
+  // checkbox iframe inside it. A 300x65 box puts the clickable point 30px
+  // from the left, vertically centered.
+  const turnstile = `<div style="position:absolute;left:40px;top:60px;width:300px;height:65px">
+      <input name="cf-turnstile-response" type="hidden">${turnstileFrame("width:100%;height:100%")}</div>`;
+  const cover = (width: number, height: number) =>
+    `<div style="position:absolute;left:40px;top:60px;width:${width}px;height:${height}px"></div>`;
   const pages: Record<string, string> = {
+    "/recaptcha/normal": recaptcha('width="304" height="78"'),
+    "/recaptcha/covered": recaptcha('width="304" height="78"') + cover(304, 78),
+    "/recaptcha/compact": recaptcha('width="164" height="144"'),
     // Standard layout: the response input's parent is the widget box.
-    "/widget": widget(frames.iframe),
-    // A custom wrapper that renders no marker input: only the widget iframe
-    // is there to find.
-    "/unmarked": `<iframe src="https://challenges.cloudflare.com/turnstile/v0/site/test/none/normal/fbE/new/hidden"
-      style="border:0;position:absolute;left:40px;top:60px;width:300px;height:65px"></iframe>`,
+    "/turnstile/widget": turnstile,
+    // A custom wrapper that renders no marker input: only the iframe is
+    // there to find.
+    "/turnstile/unmarked": turnstileFrame(
+      "position:absolute;left:40px;top:60px;width:300px;height:65px"
+    ),
     // A foreign overlay over the box must not be clicked through.
-    "/covered": `${widget(frames.iframe)}<div style="position:absolute;left:40px;top:60px;width:300px;height:65px"></div>`,
+    "/turnstile/covered": turnstile + cover(300, 65),
   };
   const server = await serve((req, res) => {
     res.setHeader("Content-Type", "text/html");
@@ -835,19 +908,21 @@ test("clicks only a visible Cloudflare Turnstile widget", async () => {
       `${pages[req.url ?? ""]}<script>addEventListener("message", e => { if (e.data === "painted") window.painted = true; else document.title = e.data; })</script>`
     );
   });
+  // Stands in for both challenge frames: it reports a press and its first
+  // paint to the page.
   const anchor = Buffer.from(
     "<script>onmousedown = () => parent.postMessage('clicked', '*');" +
       "requestAnimationFrame(() => requestAnimationFrame(() => parent.postMessage('painted', '*')))</script>"
   ).toString("base64");
   try {
     const results = await runProbe(
-      parseOptions(["--once", "--headless"]),
+      parseOptions(["--once"]),
       async ({
         cdp,
         send,
         sessionId,
-        evaluate,
         waitFor,
+        clickRecaptchaCheckbox,
         clickTurnstileCheckbox,
       }) => {
         cdp.on("Fetch.requestPaused", ({ requestId }) =>
@@ -859,46 +934,40 @@ test("clicks only a visible Cloudflare Turnstile widget", async () => {
           })
         );
         await cdp.Fetch.enable({
-          patterns: [{ urlPattern: "https://challenges.cloudflare.com/*" }],
+          patterns: [
+            { urlPattern: "https://www.google.com/recaptcha/*" },
+            { urlPattern: "https://challenges.cloudflare.com/*" },
+          ],
         });
         await send("Page.enable");
         const results: Record<string, { clicked: boolean; title: string }> = {};
         for (const path of Object.keys(pages)) {
-          const loaded = new Promise((resolve) =>
-            (cdp as unknown as EventEmitter).once(
-              `Page.loadEventFired.${sessionId}`,
-              resolve
-            )
-          );
+          const loaded = pageLoaded(cdp, sessionId);
           await send("Page.navigate", {
             url: `http://127.0.0.1:${portOf(server)}${path}`,
           });
           await loaded;
           await waitFor(
-            () => (window as unknown as { painted?: boolean }).painted
+            () => (window as unknown as { painted?: boolean }).painted,
+            { intervalMs: 50 }
           );
-          const clicked = await clickTurnstileCheckbox();
-          const title = await evaluate(
-            (wait: number) =>
-              new Promise<string>((resolve) => {
-                const end = Date.now() + wait;
-                const check = () =>
-                  document.title || Date.now() >= end
-                    ? resolve(document.title)
-                    : setTimeout(check, 50);
-                check();
-              }),
-            clicked ? 1000 : 0
+          results[path] = await clickUntilLanded(
+            path.startsWith("/recaptcha/")
+              ? clickRecaptchaCheckbox
+              : clickTurnstileCheckbox,
+            waitFor
           );
-          results[path] = { clicked, title };
         }
         return results;
       }
     );
     expect(results).toEqual({
-      "/widget": { clicked: true, title: "clicked" },
-      "/unmarked": { clicked: true, title: "clicked" },
-      "/covered": { clicked: false, title: "" },
+      "/recaptcha/normal": { clicked: true, title: "clicked" },
+      "/recaptcha/covered": { clicked: false, title: "" },
+      "/recaptcha/compact": { clicked: false, title: "" },
+      "/turnstile/widget": { clicked: true, title: "clicked" },
+      "/turnstile/unmarked": { clicked: true, title: "clicked" },
+      "/turnstile/covered": { clicked: false, title: "" },
     });
   } finally {
     await close(server);
@@ -917,29 +986,25 @@ test('a "Leave site?" dialog cannot block navigation', async () => {
   });
   try {
     const url = `http://127.0.0.1:${portOf(server)}`;
-    const result = await cli(
-      `
-      const loaded = () => new Promise(resolve => cdp.once(\`Page.loadEventFired.\${sessionId}\`, resolve));
-      let page = loaded();
-      await send("Page.navigate", { url: ${JSON.stringify(url)} });
-      await page;
-      const opened = [];
-      cdp.on(\`Page.javascriptDialogOpening.\${sessionId}\`, ({ type }) => opened.push(type));
-      for (const type of ["mousePressed", "mouseReleased"])
-        await send("Input.dispatchMouseEvent", { type, x: 20, y: 20, button: "left", clickCount: 1 });
-      page = loaded();
-      await send("Page.navigate", { url: ${JSON.stringify(`${url}/next`)} });
-      await page;
-      return { title: await evaluate(() => document.title), opened };
-    `,
-      ["--once", "--headless", "--timeout-ms", "20000"]
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ cdp, send, sessionId, evaluate, click }) => {
+        let page = pageLoaded(cdp, sessionId);
+        await send("Page.navigate", { url });
+        await page;
+        const opened: string[] = [];
+        cdp.on(`Page.javascriptDialogOpening.${sessionId}`, ({ type }) =>
+          opened.push(type)
+        );
+        await click("button");
+        page = pageLoaded(cdp, sessionId);
+        await send("Page.navigate", { url: `${url}/next` });
+        await page;
+        return { title: await evaluate(() => document.title), opened };
+      }
     );
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({
-      title: "Next",
-      opened: ["beforeunload"],
-    });
+    expect(result).toEqual({ title: "Next", opened: ["beforeunload"] });
   } finally {
-    server.close();
+    await close(server);
   }
 });

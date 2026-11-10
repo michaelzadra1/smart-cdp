@@ -1,10 +1,11 @@
+import { pressAt } from "./input";
 import type { Evaluate, Send } from "./probe";
 
 // Page function: the checkbox point of a visible, uncovered Cloudflare
 // Turnstile widget (a site-embedded one or a managed-challenge
 // interstitial's), or null. The widget's checkbox sits about 30px from the
 // widget box's left edge, vertically centered.
-function turnstileCheckboxPoint() {
+export function turnstileCheckboxPointInPage() {
   const candidates: { box: Element; x: number; y: number }[] = [];
   // Standard widgets embed a hidden response input inside the widget box;
   // this also holds for the managed-challenge interstitial. Its parent div
@@ -54,25 +55,11 @@ export async function clickTurnstileCheckbox({
   send: Send;
   evaluate: Evaluate;
 }): Promise<boolean> {
-  const point = await evaluate(turnstileCheckboxPoint);
+  const point = await evaluate(turnstileCheckboxPointInPage);
   if (!point) return false;
   // Land near the measured point instead of on it every time, like the
   // published pure-CDP Turnstile solvers do.
   const jitter = () => Math.floor(Math.random() * 7) - 3;
-  await send("Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x: point.x + jitter(),
-    y: point.y + jitter(),
-  });
-  const click = {
-    x: point.x + jitter(),
-    y: point.y + jitter(),
-    button: "left",
-    clickCount: 1,
-  } as const;
-  await send("Input.dispatchMouseEvent", { type: "mousePressed", ...click });
-  // A human holds a button: an instant press-release dwell would be a tell.
-  await new Promise((resolve) => setTimeout(resolve, 50 + Math.random() * 50));
-  await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...click });
+  await pressAt(send, { x: point.x + jitter(), y: point.y + jitter() });
   return true;
 }

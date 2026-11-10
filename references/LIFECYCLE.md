@@ -26,8 +26,8 @@ rotation when testing a noninteractive block. Preserve a pending visible
 challenge long enough to interact with it and inspect the result.
 
 For user interaction, tell the user the claimed window is ready and check its
-state with later probes instead of one long wait. Do not focus the window,
-activate tabs, or change global desktop/browser settings unless asked.
+state with later probes instead of one long wait. Do not change global desktop
+or browser settings unless asked.
 
 ### Signing in
 

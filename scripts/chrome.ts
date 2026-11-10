@@ -188,6 +188,13 @@ export async function launchChrome({
       `--user-data-dir=${profile}`,
       "--no-first-run",
       "--no-default-browser-check",
+      // A window behind the user's must work like a front one: without these,
+      // Chrome throttles a covered window's renderer and its timers, and on a
+      // loaded machine delays or drops the input a probe sends it. Puppeteer
+      // launches with the same three.
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-background-timer-throttling",
       ...(headless ? ["--headless=new"] : []),
       "--no-startup-window",
     ],

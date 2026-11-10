@@ -22,6 +22,8 @@ import {
   launchChrome,
   stopChrome,
 } from "./chrome";
+import { inPageCall, returnByValueInPage } from "./in-page";
+import { clickPointInPage, type Point, press, pressAt, type } from "./input";
 import { clickRecaptchaCheckbox } from "./recaptcha";
 import type { RelayConfig, RelayState, RelayStatus } from "./relay";
 import { clickTurnstileCheckbox } from "./turnstile";
@@ -40,10 +42,18 @@ export type Evaluate = <A extends unknown[], R>(
   ...args: A
 ) => Promise<Awaited<R>>;
 
+type PollOptions<A> = { args?: A; timeoutMs?: number; intervalMs?: number };
+
 export type WaitFor = <A extends unknown[], R>(
   fn: (...args: A) => R,
-  options?: { args?: A; timeoutMs?: number; intervalMs?: number }
+  options?: PollOptions<A>
 ) => Promise<Awaited<R>>;
+
+/** Waits for the element, then presses it with trusted CDP mouse input. */
+export type Click = <A extends unknown[]>(
+  target: string | ((...args: A) => Element | null | undefined),
+  options?: PollOptions<A>
+) => Promise<void>;
 
 /** What a probe (stdin body or --file default export) receives. */
 export type ProbeContext = {
@@ -53,13 +63,23 @@ export type ProbeContext = {
   targetId: string;
   evaluate: Evaluate;
   waitFor: WaitFor;
+  click: Click;
+  type: (text: string) => Promise<void>;
+  press: (key: string) => Promise<void>;
   clickRecaptchaCheckbox: () => Promise<boolean>;
   clickTurnstileCheckbox: () => Promise<boolean>;
 };
 
-export type Probe = (context: ProbeContext) => Promise<unknown>;
+export type Probe<T = unknown> = (context: ProbeContext) => Promise<T>;
 
 const SESSION_IDLE_MS = 30 * 60 * 1000;
+
+const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
+
+class ReturnedNodeError extends Error {
+  override message =
+    "The page function returned a DOM element, which cannot leave the page: return its text or attributes, or a boolean such as !!document.querySelector(...)";
+}
 
 const usage = `Usage: bun <skill>/scripts/probe.ts [options] < probe.js
   --file <path>          Import a .ts/.js module exporting default async (context)
@@ -84,7 +104,7 @@ const usage = `Usage: bun <skill>/scripts/probe.ts [options] < probe.js
                          its profile menu labels it ("Alex (Work)", "Work") or
                          by directory ("Profile 2")
   --background           With a --personal claim: give focus back to the tab
-                         the user was on (Input.* may not reach a background tab)
+                         the user was on, and drive this one behind it
   --help
 
 By default a probe claims a new isolated Chrome, prints its ID, and leaves it
@@ -96,12 +116,16 @@ open (idle exit after 5 minutes), so Chrome asks to allow debugging only once.
 CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
-Context: { cdp, send, sessionId, targetId, evaluate, waitFor,
+Context: { cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press,
   clickRecaptchaCheckbox, clickTurnstileCheckbox }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
-evaluate(fn, ...args) serializes a self-contained page function and JSON arguments.
+evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
+and returns its JSON value; a returned DOM element throws.
 waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) re-evaluates fn until
 it returns a truthy value, surviving redirects and reloads; throws on timeout.
+click(selector | fn, { args, timeoutMs, intervalMs }) presses the element once it
+is visible and uncovered; type(text) types into the focused element; press(key)
+presses one key such as "Enter". All three send trusted input, unlike el.click().
 Returns JSON on stdout. Lifecycle diagnostics go to stderr.
 `;
 
@@ -518,10 +542,11 @@ const errorText = (error: unknown) =>
 const navigated =
   /navigated or closed|context was destroyed|Cannot find (default execution )?context/;
 
-export async function runProbe(
+/** Runs a typed probe, or stdin code (the CLI's only), in the browser. */
+export async function runProbe<T = unknown>(
   options: ProbeOptions,
-  snippet: string | Probe
-): Promise<unknown> {
+  snippet: string | Probe<T>
+): Promise<T> {
   let chrome: Chrome | undefined;
   let session: RelayState | undefined;
   let cdp: CdpClient | undefined;
@@ -665,12 +690,9 @@ export async function runProbe(
       );
       await send("Page.enable");
     }
-    const evaluateOnce = async (
-      fn: (...args: never[]) => unknown,
-      args: unknown[]
-    ) => {
+    const evaluateOnce = async (expression: string) => {
       const result = await send("Runtime.evaluate", {
-        expression: `(${fn.toString()})(...${JSON.stringify(args)})`,
+        expression,
         returnByValue: true,
         awaitPromise: true,
       });
@@ -681,48 +703,24 @@ export async function runProbe(
         );
       return result.result.value;
     };
+    const evaluateValue = async <A extends unknown[]>(
+      fn: (...args: A) => unknown,
+      args: A
+    ) => {
+      const result = await evaluateOnce(
+        inPageCall(returnByValueInPage, fn, args)
+      );
+      if (result.node) throw new ReturnedNodeError();
+      return result.value;
+    };
     const evaluate: Evaluate = (fn, ...args) =>
-      evaluateOnce(fn, args).catch((error: Error) => {
+      evaluateValue(fn, args).catch((error: Error) => {
         if (error instanceof CdpProtocolError && navigated.test(error.message))
           error.message +=
             ". The page navigated while evaluate ran; wait for the new page with waitFor()";
         throw error;
       });
-    // Polls from the host with short evaluations: a redirect or reload between
-    // polls costs one retry, where one long in-page wait fails outright.
-    const waitFor: WaitFor = async (
-      fn,
-      { args, timeoutMs = 30000, intervalMs = 250 } = {}
-    ) => {
-      const deadline = Date.now() + timeoutMs;
-      const late = Symbol("late");
-      let lastError: Error | undefined;
-      for (;;) {
-        const attempt = evaluateOnce(fn, args ?? []);
-        attempt.catch(() => {});
-        try {
-          const remaining = Math.max(deadline - Date.now(), 0);
-          const value = await Promise.race([
-            attempt,
-            delay(remaining, late, { ref: false }),
-          ]);
-          if (value === late) break;
-          if (value) return value;
-          lastError = undefined;
-        } catch (error) {
-          const failure = error as Error;
-          // A page exception, often a document still loading, is not a
-          // protocol error.
-          if (
-            failure instanceof CdpProtocolError &&
-            !navigated.test(failure.message)
-          )
-            throw failure;
-          lastError = failure;
-        }
-        if (Date.now() >= deadline) break;
-        await delay(intervalMs);
-      }
+    const pageUrl = async () => {
       const { targetInfos } = await client.Target.getTargets().catch(() => ({
         targetInfos: [],
       }));
@@ -731,13 +729,100 @@ export async function runProbe(
       const url =
         targetInfos.find((target) => target.targetId === targetId)?.url ??
         (await Promise.race([
-          evaluateOnce(() => location.href, []).catch(() => null),
+          evaluate(() => location.href).catch(() => null),
           delay(2000, null, { ref: false }),
         ]));
-      throw new Error(
-        `waitFor timed out after ${timeoutMs}ms on ${typeof url === "string" ? url : "a closed page"}` +
-          (lastError ? `; last error: ${lastError.message.split("\n")[0]}` : "")
+      return typeof url === "string" ? url : "a closed page";
+    };
+    // Polls from the host with short evaluations: a redirect or reload between
+    // polls costs one retry, where one long in-page wait fails outright.
+    // Resolves with the first value of `attempt` that `done` accepts; on
+    // timeout, `explain` words the last value or page error.
+    const poll = async (
+      name: string,
+      evaluateAttempt: () => Promise<unknown>,
+      options: PollOptions<unknown[]>,
+      done: (value: unknown) => boolean,
+      explain: (last: unknown, lastError?: string) => string
+    ) => {
+      const unknown = Object.keys(options).filter(
+        (key) => !POLL_OPTIONS.includes(key)
       );
+      if (unknown.length)
+        throw new Error(
+          `${name}: unknown option ${unknown.join(", ")}; it takes ${POLL_OPTIONS.join(", ")}`
+        );
+      const { timeoutMs = 30000, intervalMs = 250 } = options;
+      const deadline = Date.now() + timeoutMs;
+      const late = Symbol("late");
+      let last: unknown;
+      let lastError: Error | undefined;
+      for (;;) {
+        const attempt = evaluateAttempt();
+        attempt.catch(() => {});
+        try {
+          const remaining = Math.max(deadline - Date.now(), 0);
+          const value = await Promise.race([
+            attempt,
+            delay(remaining, late, { ref: false }),
+          ]);
+          if (value === late) break;
+          if (done(value)) return value;
+          last = value;
+          lastError = undefined;
+        } catch (error) {
+          const failure = error as Error;
+          // A page exception, often a document still loading, is not a
+          // protocol error.
+          if (
+            failure instanceof ReturnedNodeError ||
+            (failure instanceof CdpProtocolError &&
+              !navigated.test(failure.message))
+          )
+            throw failure;
+          lastError = failure;
+        }
+        if (Date.now() >= deadline) break;
+        await delay(intervalMs);
+      }
+      throw new Error(
+        `${name} timed out after ${timeoutMs}ms on ${await pageUrl()}` +
+          explain(last, lastError?.message.split("\n")[0])
+      );
+    };
+    const waitFor: WaitFor = (fn, options = {}) =>
+      poll(
+        "waitFor",
+        () => evaluateValue(fn, options.args ?? ([] as never)),
+        options,
+        Boolean,
+        (_, error) => (error ? `; last error: ${error}` : "")
+      ) as Promise<never>;
+    const click: Click = async (target, options = {}) => {
+      const [find, args, label] =
+        typeof target === "string"
+          ? [
+              (selector: string) => document.querySelector(selector),
+              [target],
+              target,
+            ]
+          : [target, options.args ?? [], "the element"];
+      const point = await poll(
+        "click",
+        () =>
+          evaluateOnce(
+            inPageCall(
+              clickPointInPage,
+              find as (...args: unknown[]) => unknown,
+              args
+            )
+          ),
+        options,
+        (value) => typeof value === "object" && value !== null && "x" in value,
+        (last, error) =>
+          `: ${label} ${(last as { miss?: string } | undefined)?.miss ?? `failed: ${error}`}`
+      );
+      await pressAt(send, point as Point);
     };
     const context: ProbeContext = {
       cdp: client,
@@ -746,15 +831,20 @@ export async function runProbe(
       targetId,
       evaluate,
       waitFor,
+      click,
+      type: (text) => type(send, text),
+      press: (key) => press(send, key),
       clickRecaptchaCheckbox: () => clickRecaptchaCheckbox({ send, evaluate }),
       clickTurnstileCheckbox: () => clickTurnstileCheckbox({ send, evaluate }),
     };
     const run =
       typeof snippet === "string"
-        ? new AsyncFunction(`{ ${Object.keys(context)} }`, snippet)
+        ? // The block lets a probe declare its own names, such as a helper
+          // called click, over the context's.
+          new AsyncFunction(`{ ${Object.keys(context)} }`, `{\n${snippet}\n}`)
         : snippet;
     try {
-      return await run(context);
+      return (await run(context)) as T;
     } finally {
       if (!personal)
         await client.Target.detachFromTarget({ sessionId }).catch(() => {});
