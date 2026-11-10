@@ -1,0 +1,21 @@
+{
+  "name": "smart-cdp",
+  "version": "6.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "lint": "biome lint .",
+    "format": "biome check --write . --unsafe",
+    "typecheck": "bun check",
+    "test": "bun test --timeout 30000"
+  },
+  "dependencies": {
+    "devtools-protocol": "0.0.1173815"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.2",
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

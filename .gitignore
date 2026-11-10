@@ -1,0 +1,3 @@
+node_modules/
+extension/secret.json
+.DS_Store
