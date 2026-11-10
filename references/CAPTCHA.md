@@ -1,5 +1,12 @@
 # Visible challenges
 
+## Contents
+
+- [reCAPTCHA checkbox](#recaptcha-checkbox)
+- [Cloudflare Turnstile and the managed-challenge interstitial](#cloudflare-turnstile-and-the-managed-challenge-interstitial)
+- [HUMAN (PerimeterX) Press & Hold](#human-perimeterx-press--hold)
+- [Other layouts](#other-layouts)
+
 Try a visible challenge in the same session before rotating or discarding it.
 A challenge page is not proof that the IP must cool down, and it is never an
 empty result.
@@ -77,12 +84,47 @@ Chrome 157 the check passes. A passing bot-check with a still-failing site
 points at host fingerprinting rather than the click; work through
 [STEALTH.md](STEALTH.md) instead of re-clicking.
 
+## HUMAN (PerimeterX) Press & Hold
+
+`holdPressAndHoldButton()` (from `scripts/press-hold.ts`, in the probe
+context) handles the "press and hold to verify" challenge HUMAN (formerly
+PerimeterX) shows — walmart.ca's `/blocked` page ("We like real shoppers, not
+robots!") is one. It finds the live `iframe[title*="Human verification"]`,
+presses its wide `[role=button]` ("Press & Hold Human Challenge") at the
+center with trusted mouse input, and holds — with a pixel of tremor, as a
+held real mouse has — until the challenge announces completion (its
+`#checkmark` draws and an aria-live region says "Human Challenge completed"),
+then releases. It returns `{ heldMs, completed, cleared }`, or `false` when no
+live challenge is on the page.
+
+Two PX traits shape the helper; keep them in mind when probing these pages by
+hand:
+
+- PX mounts decoy copies of the challenge iframe, `display:none`, beside the
+  live one, some inside a shadow root. The live one is the only one with a
+  box model, and page JS cannot see inside any of them.
+- PX hooks the page's geometry APIs: on these pages `getBoundingClientRect`
+  can return `undefined` and `getComputedStyle` empty strings. Measure
+  through the DOM domain (`DOM.getDocument({ depth: -1, pierce: true })`,
+  `DOM.getBoxModel`), never page JS. Chrome reports box quads in viewport CSS
+  pixels (they move with scroll), the coordinates `Input.dispatchMouseEvent`
+  wants.
+
+Validation runs on release, not during the hold: the URL stays on `/blocked`
+while the button is held and navigates a few seconds after a successful
+release. `cleared` means the URL moved or the challenge frame vanished within
+15 seconds of the release. When `completed` is true but `cleared` is false,
+wait a few more seconds before judging. Allow about three attempts, then stop
+and work through [STEALTH.md](STEALTH.md).
+
 ## Other layouts
 
 Capture `Page.captureScreenshot({ format: "png", captureBeyondViewport: false })`
 and locate the actual visible control; never click an iframe's center blindly or
 inject tokens. Input uses viewport CSS pixels, so scale screenshot measurements
-by the viewport size. `DOM.getDocument({ depth: -1, pierce: true })` inspects
+by the viewport size. A press that lands before a cold background window's first
+paint is dropped while its moves queue and flush; capture a screenshot first
+to force the frame. `DOM.getDocument({ depth: -1, pierce: true })` inspects
 shadow roots and same-process frames; an out-of-process frame needs its own
 session ([PROTOCOL.md](PROTOCOL.md#targets-and-child-sessions)). Reinspect after
 each action. An image or audio challenge opened by a checkbox is unsolved until

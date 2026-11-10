@@ -979,6 +979,105 @@ test("clicks only a visible, uncovered reCAPTCHA or Turnstile checkbox", async (
   }
 }, 30000);
 
+test("holds a HUMAN Press & Hold button until the challenge completes", async () => {
+  // The live challenge frame, as PX serves it: a wide role=button whose hold
+  // timer draws the checkmark and announces completion; release after that
+  // clears the challenge. Mouse events and the press timing go to the page.
+  const frame = `<body style="margin:1px">
+    <div role="button" aria-label="Press &amp; Hold Human Challenge" id="hold"
+      style="width:260px;height:100px;border:2px solid">Press &amp; Hold
+      <div id="checkmark"></div><span aria-live="assertive" id="live"></span></div>
+    <script>
+      const hold = document.getElementById("hold");
+      let timer = 0, done = false;
+      hold.addEventListener("mousedown", (e) => {
+        parent.postMessage(["mousedown", e.isTrusted], "*");
+        timer = setTimeout(() => {
+          done = true;
+          document.getElementById("checkmark").className = "draw";
+          document.getElementById("live").textContent = "Human Challenge completed, please wait";
+        }, 1500);
+      });
+      hold.addEventListener("mouseup", (e) => {
+        parent.postMessage(["mouseup", e.isTrusted], "*");
+        clearTimeout(timer);
+        if (done) parent.postMessage(["cleared", true], "*");
+      });
+      addEventListener("mousemove", (e) => parent.postMessage(["mousemove", e.isTrusted], "*"));
+    </script></body>`;
+  const challenge = (visible: boolean) =>
+    `<iframe title="Human verification challenge" src="/px-frame"
+      style="${visible ? "" : "display:none;"}width:100%;height:102px;border:0"></iframe>`;
+  // As on walmart.ca: the challenge sits in a shadow root, below the fold,
+  // next to display:none decoys of itself.
+  const page = (frames: string) => `
+    <body><div style="height:3000px"></div><div id="px-captcha"></div>
+    <script>
+      const host = document.getElementById("px-captcha");
+      host.attachShadow({ mode: "open" }).innerHTML = ${JSON.stringify(frames)};
+      window.events = [];
+      addEventListener("message", (e) => {
+        if (!Array.isArray(e.data)) return;
+        window.events.push(e.data);
+        if (e.data[0] === "cleared") { host.remove(); document.title = "cleared"; }
+      });
+    </script></body>`;
+  const server = await serve((req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end(
+      req.url === "/px-frame"
+        ? frame
+        : req.url === "/challenge"
+          ? page(challenge(false) + challenge(false) + challenge(true))
+          : page(challenge(false) + challenge(false))
+    );
+  });
+  try {
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ cdp, send, sessionId, evaluate, holdPressAndHoldButton }) => {
+        const base = `http://127.0.0.1:${portOf(server)}`;
+        await send("Page.enable");
+        let loaded = pageLoaded(cdp, sessionId);
+        await send("Page.navigate", { url: `${base}/challenge` });
+        await loaded;
+        const held = await holdPressAndHoldButton();
+        const events = await evaluate(
+          () => (window as unknown as { events: [string, boolean][] }).events
+        );
+        const title = await evaluate(() => document.title);
+        loaded = pageLoaded(cdp, sessionId);
+        await send("Page.navigate", { url: `${base}/decoys-only` });
+        await loaded;
+        const decoys = await holdPressAndHoldButton();
+        return { held, events, title, decoys };
+      }
+    );
+    expect(typeof result.held).toBe("object");
+    const held = result.held as {
+      heldMs: number;
+      completed: boolean;
+      cleared: boolean;
+    };
+    // Held until the frame's 1.5s timer was seen at the next poll, then
+    // released well before the 12s cap.
+    expect(held.heldMs).toBeGreaterThanOrEqual(1400);
+    expect(held.heldMs).toBeLessThan(8000);
+    expect(held.completed).toBe(true);
+    expect(held.cleared).toBe(true);
+    expect(result.title).toBe("cleared");
+    const types = result.events.map(([type]) => type);
+    expect(result.events.filter(([, trusted]) => !trusted)).toEqual([]);
+    expect(types).toContain("mousedown");
+    expect(types).toContain("mouseup");
+    // The approach and the in-hold tremble both move the mouse.
+    expect(types.filter((t) => t === "mousemove").length).toBeGreaterThan(2);
+    expect(result.decoys).toBe(false);
+  } finally {
+    await close(server);
+  }
+}, 30000);
+
 test('a "Leave site?" dialog cannot block navigation', async () => {
   const server = await serve((req, res) => {
     res.setHeader("Content-Type", "text/html");
