@@ -75,9 +75,10 @@ test("heartbeats and debugger events cannot send on a closing or closed WebSocke
   expect(sends).toBe(2);
 });
 
-test("a background claim gives focus back to the tab the user used last", async () => {
+test("a background claim gives focus back to the tab or window the user used last", async () => {
   const secret = "s";
   const activated: number[] = [];
+  const sentBehind: number[] = [];
   let onUpdated: (tab: number, change: { url: string }) => void = () => {};
   type Handler = (event?: { data: string }) => Promise<void> | void;
   const sockets: { onopen?: Handler; onmessage?: Handler; sent: string[] }[] =
@@ -104,14 +105,22 @@ test("a background claim gives focus back to the tab the user used last", async 
         },
       },
       onRemoved: event(),
-      get: async (id: number) => ({ id, windowId: 7 }),
-      query: async () => [
-        { id: 2, lastAccessed: 300 },
-        { id: 3, lastAccessed: 900 },
-        { id: 4, lastAccessed: 100 },
-        { id: 5, lastAccessed: 1000 },
-      ],
+      // Tab 8 opened in a new window of its own; the others share window 7.
+      get: async (id: number) => ({ id, windowId: id === 8 ? 9 : 7 }),
+      query: async ({ windowId }: { windowId: number }) =>
+        windowId === 9
+          ? [{ id: 8, lastAccessed: 2000 }]
+          : [
+              { id: 2, lastAccessed: 300 },
+              { id: 3, lastAccessed: 900 },
+              { id: 4, lastAccessed: 100 },
+              { id: 5, lastAccessed: 1000 },
+            ],
       update: async (id: number) => activated.push(id),
+    },
+    windows: {
+      update: async (id: number, { focused }: { focused: boolean }) =>
+        focused || sentBehind.push(id),
     },
     debugger: {
       onEvent: event(),
@@ -136,6 +145,7 @@ test("a background claim gives focus back to the tab the user used last", async 
   for (const [tabId, background] of [
     [5, true],
     [6, false],
+    [8, true],
   ] as const) {
     const id = `00000000-0000-4000-8000-00000000000${tabId}`;
     onUpdated(tabId, { url: `http://127.0.0.1:9/smart-cdp/${id}` });
@@ -150,4 +160,5 @@ test("a background claim gives focus back to the tab the user used last", async 
     });
   }
   expect(activated).toEqual([3]);
+  expect(sentBehind).toEqual([9]);
 });

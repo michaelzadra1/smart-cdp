@@ -104,9 +104,11 @@ closed: a session name keeps its profile.
 
 Chrome brings the new tab to the front. For work that runs beside the page
 the user is on, add `--background` to the claiming probe: the extension then
-reactivates the tab they used last. Chrome need not deliver `Input.*` to a
-background tab, so press with page events (`mousedown`, `mouseup`, `click`)
-and turn on `Emulation.setFocusEmulationEnabled` there.
+reactivates the tab they used last in that window, or, when Chrome gave the
+tab a window of its own, sends that window behind theirs. Chrome need not
+deliver `Input.*` to a background tab, so press with page events
+(`mousedown`, `mouseup`, `click`) and turn on
+`Emulation.setFocusEmulationEnabled` there.
 
 The extension is needed only for `--personal`. The first `--personal` claim
 in a profile fails after 20 seconds if it isn't loaded there, and the error

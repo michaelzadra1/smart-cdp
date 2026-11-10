@@ -4,7 +4,7 @@
 // secret.json (the host writes it), then attaches chrome.debugger to that one
 // tab and carries its CDP messages both ways. chrome.debugger has no remote
 // debugging prompt. A proof with background: true first gives focus back to
-// the window's previously active tab. Host control messages: {"type":"reset"} detaches and
+// what the user was using. Host control messages: {"type":"reset"} detaches and
 // reattaches, which clears everything the last probe enabled;
 // {"type":"close"} closes the tab.
 
@@ -33,15 +33,18 @@ async function hmac(message) {
     .join("");
 }
 
-// Chrome activates a tab opened from its command line; reactivate the tab
-// the user used last in that window.
+// Chrome brings a tab opened from its command line to the front, in an
+// existing window or a new one of its own. Reactivate the tab the user used
+// last in that window, or send a window of its own behind the user's.
 async function restoreFocus(tabId) {
   const { windowId } = await chrome.tabs.get(tabId);
   const [previous] = (await chrome.tabs.query({ windowId }))
     .filter((tab) => tab.id !== tabId)
     .sort((a, b) => b.lastAccessed - a.lastAccessed);
-  if (previous)
-    await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+  await (previous
+    ? chrome.tabs.update(previous.id, { active: true })
+    : chrome.windows.update(windowId, { focused: false })
+  ).catch(() => {});
 }
 
 function start(tabId, url) {
