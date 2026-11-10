@@ -7,6 +7,8 @@
   tests in TypeScript and test with `bun:test`.
 - Validate code changes with `bun run format && bun run typecheck`, then
   `bun run test`; let Biome fix formatting-only issues.
+- Test against visible Chrome, the mode the skill runs in almost every time.
+  Pass `--headless` only in a test of the `--headless` option itself.
 - Keep the skill generic: nothing about one person's machine, profiles or
   projects. Users name a Chrome profile in their prompt; they configure
   nothing.

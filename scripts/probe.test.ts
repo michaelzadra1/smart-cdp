@@ -23,6 +23,7 @@ import {
   relayStatePath,
   runProbe,
   sessionStatePath,
+  type WaitFor,
   waitForExit,
 } from "./probe";
 
@@ -69,6 +70,23 @@ async function serve(handler: Parameters<typeof createServer>[1]) {
   const server = createServer(handler);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return server;
+}
+
+// A click into a fresh cross-origin frame can miss (see CAPTCHA.md), so
+// click until the frame reports the press.
+async function clickUntilLanded(
+  click: () => Promise<boolean>,
+  waitFor: WaitFor
+) {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    if (!(await click())) return { clicked: false, title: "" };
+    const title = await waitFor(() => document.title, {
+      timeoutMs: 200,
+      intervalMs: 50,
+    }).catch(() => "");
+    if (title || Date.now() >= deadline) return { clicked: true, title };
+  }
 }
 
 const portOf = (server: Server) => (server.address() as AddressInfo).port;
@@ -142,18 +160,13 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       await loaded;
       return await evaluate(suffix => ({ title: document.title, text: document.querySelector("h1").textContent + suffix, webdriver: navigator.webdriver }), "!");
     `,
-        ["--once", "--headless"]
+        ["--once"]
       ),
       cli(
         'return await evaluate(() => { throw new Error("page failure"); });',
-        ["--once", "--headless"]
+        ["--once"]
       ),
-      cli("await new Promise(() => {});", [
-        "--once",
-        "--headless",
-        "--timeout-ms",
-        "2000",
-      ]),
+      cli("await new Promise(() => {});", ["--once", "--timeout-ms", "2000"]),
       // Like an attach listener awaiting a command on a paused popup: closing
       // Chrome rejects it, which used to crash cleanup and lose the result.
       cli(
@@ -162,7 +175,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       Promise.reject(new Error("listener failure"));
       return "kept";
     `,
-        ["--once", "--headless"]
+        ["--once"]
       ),
       cli(
         `
@@ -170,7 +183,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
       process.kill(processInfo.find(p => p.type === "browser").id, "SIGKILL");
       await new Promise(() => {});
     `,
-        ["--once", "--headless", "--timeout-ms", "20000"]
+        ["--once", "--timeout-ms", "20000"]
       ),
     ]);
     expect(success.status, success.stderr).toBe(0);
@@ -214,7 +227,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
           await loaded;
           ${body}
         `,
-          ["--once", "--headless", "--profile", profile]
+          ["--once", "--profile", profile]
         );
       const signIn = await visit(
         'return await evaluate(() => { document.cookie = "session=1; max-age=3600"; return true; });'
@@ -233,7 +246,7 @@ test("standalone Chrome extraction, attachment, failures, and cleanup", async ()
     let relayPid = 0;
     let proxied = "";
     await runProbe(
-      parseOptions(["--once", "--headless"]),
+      parseOptions(["--once"]),
       async ({ cdp, targetId, send }) => {
         // Chrome prompts per upstream WebSocket, so count them through a proxy.
         let upstreams = 0;
@@ -368,7 +381,7 @@ test("waitFor survives a page that replaces itself after load", async () => {
       const timedOut = await waitFor(() => { throw new Error("boom"); }, { timeoutMs: 300 }).catch(e => e.message);
       return { longWait, landed, timedOut };
     `,
-      ["--once", "--headless"]
+      ["--once"]
     );
     expect(result.status, result.stderr).toBe(0);
     const { longWait, landed, timedOut } = JSON.parse(result.stdout);
@@ -386,7 +399,7 @@ test("waitFor survives a page that replaces itself after load", async () => {
 }, 30000);
 
 test("explains a sandbox that blocks loopback sockets", async () => {
-  const { status, stderr } = await cli("return 1;", ["--headless"], probe, [
+  const { status, stderr } = await cli("return 1;", [], probe, [
     "sandbox-exec",
     "-p",
     "(version 1)(allow default)(deny network*)",
@@ -400,7 +413,7 @@ test("explains a sandbox that blocks loopback sockets", async () => {
 test("a probe claims a browser by default and keeps it until released", async () => {
   const claimed = await cli(
     'await send("Page.navigate", { url: "data:text/html,<title>claimed</title>" }); return 1;',
-    ["--headless"]
+    []
   );
   expect(claimed.status, claimed.stderr).toBe(0);
   const [, id, chromePid] =
@@ -417,7 +430,6 @@ test("a probe claims a browser by default and keeps it until released", async ()
     const next = await cli("return await evaluate(() => document.title);", [
       "--session",
       id ?? "",
-      "--headless",
     ]);
     expect(next.status, next.stderr).toBe(0);
     expect(JSON.parse(next.stdout)).toBe("claimed");
@@ -612,7 +624,7 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
     res.end(`<title>${req.url}</title>`);
   });
   const name = `test-${process.pid}`;
-  const inSession = ["--session", name, "--headless"];
+  const inSession = ["--session", name];
   try {
     const url = `http://127.0.0.1:${portOf(server)}/kept`;
     const first = await cli(
@@ -659,11 +671,11 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
       page: ["/kept", 2],
     });
 
-    // Leaving out --headless asks for a visible browser; the refusal says how to continue.
-    const visible = await cli("return 1;", ["--session", name]);
-    expect(visible.status).toBe(1);
-    expect(visible.stderr).toMatch(
-      /runs headless Chrome .*To continue in it, pass --headless/
+    // Adding --headless asks for another browser; the refusal says how to continue.
+    const headless = await cli("return 1;", ["--session", name, "--headless"]);
+    expect(headless.status).toBe(1);
+    expect(headless.stderr).toMatch(
+      /runs visible Chrome .*To continue in it, leave out --headless/
     );
 
     const ended = await cli("", ["--end-session", name]);
@@ -721,6 +733,112 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
   }
 }, 60000);
 
+test("click, type and press send trusted input, in a hidden tab too", async () => {
+  // Sites such as payroll apps sign the user out on untrusted (page-script)
+  // events, so the page records every event's isTrusted.
+  const server = await serve((_req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end(`<button id="year" style="position:absolute;left:40px;top:40px">Year</button>
+      <input id="field" style="position:absolute;left:40px;top:100px">
+      <button id="under" style="position:absolute;left:40px;top:160px">Under</button>
+      <div id="overlay" style="position:absolute;left:30px;top:150px;width:200px;height:50px"></div>
+      <script>
+        window.events = [];
+        for (const type of ["mousemove", "pointerdown", "mousedown", "mouseup", "click", "keydown", "input"])
+          addEventListener(type, (e) => events.push([type, e.isTrusted, e.target.id, e.key ?? null, e.keyCode ?? null, e.shiftKey ?? null]), true);
+        year.onclick = () => setTimeout(() => {
+          const option = document.createElement("div");
+          option.role = "option";
+          option.textContent = "2024";
+          option.style = "position:absolute;left:40px;top:2000px;width:80px;height:20px";
+          option.onclick = () => (document.title = "picked " + option.textContent);
+          document.body.append(option);
+        }, 400);
+      </script>`);
+  });
+  try {
+    const url = `http://127.0.0.1:${portOf(server)}`;
+    const result = await cli(
+      `
+      // A probe may name its own helpers after the context's.
+      const click = (target, options) => arguments[0].click(target, options);
+      await send("Page.navigate", { url: ${JSON.stringify(url)} });
+      await waitFor(() => document.readyState === "complete");
+      const front = await cdp.Target.createTarget({ url: "about:blank" });
+      await cdp.Target.activateTarget({ targetId: front.targetId });
+      await waitFor(() => document.visibilityState === "hidden");
+      // A hidden tab holds a mouseMoved for about 5 seconds, so a click that
+      // waited on one would take that long.
+      const started = Date.now();
+      await click("#year");
+      // The option renders 400ms later and below the fold.
+      await click((text) => [...document.querySelectorAll("[role=option]")].find((o) => o.textContent === text), { args: ["2024"] });
+      await click("#field");
+      const clickMs = Date.now() - started;
+      await type("Ab1 .");
+      await press("Enter");
+      const failures = await Promise.all([
+        click("#under", { timeoutMs: 300 }),
+        click("#missing", { timeoutMs: 300 }),
+        press("F13"),
+        waitFor(() => true, { timeout: 5000 }),
+        waitFor(() => document.body),
+      ].map((p) => p.then(() => "resolved", (e) => e.message)));
+      return {
+        clickMs,
+        failures,
+        ...(await evaluate(() => ({ title: document.title, value: field.value, events }))),
+      };
+    `,
+      ["--once", "--timeout-ms", "25000"]
+    );
+    expect(result.status, result.stderr).toBe(0);
+    const { clickMs, failures, title, value, events } = JSON.parse(
+      result.stdout
+    );
+    expect(clickMs).toBeLessThan(3000);
+    expect(title).toBe("picked 2024");
+    expect(value).toBe("Ab1 .");
+    expect(events.filter(([, trusted]: [string, boolean]) => !trusted)).toEqual(
+      []
+    );
+    const on = (id: string) =>
+      events
+        .filter((event: unknown[]) => event[2] === id && event[0] !== "keydown")
+        .map(([type]: string[]) => type);
+    // The move a hidden tab holds still arrives, before the press.
+    expect(on("year")).toEqual([
+      "mousemove",
+      "pointerdown",
+      "mousedown",
+      "mouseup",
+      "click",
+    ]);
+    expect(
+      events
+        .filter(([type]: string[]) => type === "keydown")
+        .map((event: unknown[]) => event.slice(3))
+    ).toEqual([
+      ["A", 65, true],
+      ["b", 66, false],
+      ["1", 49, false],
+      [" ", 32, false],
+      ["Enter", 13, false],
+    ]);
+    expect(failures[0]).toMatch(
+      /^click timed out after 300ms on http:.*: #under is covered by <div#overlay>$/
+    );
+    expect(failures[1]).toMatch(/: #missing matched no element$/);
+    expect(failures[2]).toMatch(/^press: unknown key "F13"; use a letter/);
+    expect(failures[3]).toBe(
+      "waitFor: unknown option timeout; it takes args, timeoutMs, intervalMs"
+    );
+    expect(failures[4]).toMatch(/^The page function returned a DOM element/);
+  } finally {
+    await close(server);
+  }
+}, 30000);
+
 test("clicks only a visible normal-size reCAPTCHA checkbox", async () => {
   const widget = (extra = "") =>
     `<iframe src="https://www.google.com/recaptcha/api2/anchor?k=test" ${extra}
@@ -744,15 +862,8 @@ test("clicks only a visible normal-size reCAPTCHA checkbox", async () => {
   ).toString("base64");
   try {
     const results = await runProbe(
-      parseOptions(["--once", "--headless"]),
-      async ({
-        cdp,
-        send,
-        sessionId,
-        evaluate,
-        waitFor,
-        clickRecaptchaCheckbox,
-      }) => {
+      parseOptions(["--once"]),
+      async ({ cdp, send, sessionId, waitFor, clickRecaptchaCheckbox }) => {
         cdp.on("Fetch.requestPaused", ({ requestId }) =>
           cdp.Fetch.fulfillRequest({
             requestId,
@@ -780,20 +891,10 @@ test("clicks only a visible normal-size reCAPTCHA checkbox", async () => {
           await waitFor(
             () => (window as unknown as { painted?: boolean }).painted
           );
-          const clicked = await clickRecaptchaCheckbox();
-          const title = await evaluate(
-            (wait: number) =>
-              new Promise<string>((resolve) => {
-                const end = Date.now() + wait;
-                const check = () =>
-                  document.title || Date.now() >= end
-                    ? resolve(document.title)
-                    : setTimeout(check, 50);
-                check();
-              }),
-            clicked ? 1000 : 0
+          results[path] = await clickUntilLanded(
+            clickRecaptchaCheckbox,
+            waitFor
           );
-          results[path] = { clicked, title };
         }
         return results;
       }
@@ -841,15 +942,8 @@ test("clicks only a visible Cloudflare Turnstile widget", async () => {
   ).toString("base64");
   try {
     const results = await runProbe(
-      parseOptions(["--once", "--headless"]),
-      async ({
-        cdp,
-        send,
-        sessionId,
-        evaluate,
-        waitFor,
-        clickTurnstileCheckbox,
-      }) => {
+      parseOptions(["--once"]),
+      async ({ cdp, send, sessionId, waitFor, clickTurnstileCheckbox }) => {
         cdp.on("Fetch.requestPaused", ({ requestId }) =>
           cdp.Fetch.fulfillRequest({
             requestId,
@@ -877,20 +971,10 @@ test("clicks only a visible Cloudflare Turnstile widget", async () => {
           await waitFor(
             () => (window as unknown as { painted?: boolean }).painted
           );
-          const clicked = await clickTurnstileCheckbox();
-          const title = await evaluate(
-            (wait: number) =>
-              new Promise<string>((resolve) => {
-                const end = Date.now() + wait;
-                const check = () =>
-                  document.title || Date.now() >= end
-                    ? resolve(document.title)
-                    : setTimeout(check, 50);
-                check();
-              }),
-            clicked ? 1000 : 0
+          results[path] = await clickUntilLanded(
+            clickTurnstileCheckbox,
+            waitFor
           );
-          results[path] = { clicked, title };
         }
         return results;
       }
@@ -925,14 +1009,13 @@ test('a "Leave site?" dialog cannot block navigation', async () => {
       await page;
       const opened = [];
       cdp.on(\`Page.javascriptDialogOpening.\${sessionId}\`, ({ type }) => opened.push(type));
-      for (const type of ["mousePressed", "mouseReleased"])
-        await send("Input.dispatchMouseEvent", { type, x: 20, y: 20, button: "left", clickCount: 1 });
+      await click("button");
       page = loaded();
       await send("Page.navigate", { url: ${JSON.stringify(`${url}/next`)} });
       await page;
       return { title: await evaluate(() => document.title), opened };
     `,
-      ["--once", "--headless", "--timeout-ms", "20000"]
+      ["--once", "--timeout-ms", "20000"]
     );
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({

@@ -97,9 +97,11 @@ await writeFile("/absolute/task/path/page.png", Buffer.from(data, "base64"));
 ```
 
 Inspect the screenshot before acting on visual controls. Input coordinates are
-viewport CSS pixels, not necessarily image pixels. Measure visible bounds;
-dispatch mouseMoved, mousePressed, and mouseReleased through
-`send("Input.dispatchMouseEvent", ...)`, then inspect the actual resulting state.
+viewport CSS pixels, not necessarily image pixels. `click`, `type` and `press`
+cover presses and typing. For a hover, drag or scroll, measure visible bounds
+and send `mouseMoved`, `mousePressed`, `mouseReleased` or `mouseWheel` through
+`send("Input.dispatchMouseEvent", ...)`, then inspect the actual resulting
+state.
 
 ## Targets and child sessions
 
@@ -168,7 +170,7 @@ await cdp.send("Target.setAutoAttach", {
   flatten: true,
   filter: [{ type: "page" }],
 });
-// Click the link with Input.dispatchMouseEvent: a scripted click is popup-blocked.
+// Open it with click(): a page-script el.click() is popup-blocked.
 const opened = await Promise.race([popup, sleep(10000)]);
 // Read the popup with cdp.send(method, params, opened.sid), then close it.
 cdp.off("Target.attachedToTarget", onAttach);

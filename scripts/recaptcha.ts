@@ -1,3 +1,4 @@
+import { pressAt } from "./input";
 import type { Evaluate, Send } from "./probe";
 
 // Page function: the checkbox point of a visible, uncovered, normal-size
@@ -30,9 +31,6 @@ export async function clickRecaptchaCheckbox({
 }): Promise<boolean> {
   const point = await evaluate(recaptchaCheckboxPoint);
   if (!point) return false;
-  const click = { ...point, button: "left", clickCount: 1 } as const;
-  await send("Input.dispatchMouseEvent", { type: "mouseMoved", ...point });
-  await send("Input.dispatchMouseEvent", { type: "mousePressed", ...click });
-  await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...click });
+  await pressAt(send, point);
   return true;
 }

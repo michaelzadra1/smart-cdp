@@ -16,8 +16,11 @@ if (!(await clickRecaptchaCheckbox())) throw new Error("no clickable checkbox");
 // Wait up to ~10s for the page you actually wanted, then verify its content.
 ```
 
-Click once the widget shows on a screenshot, not straight after load: input
-sent to a cross-origin frame before it has painted can miss it.
+Click once the widget shows on a screenshot, not straight after load. Visible
+Chrome routes a click to a cross-origin frame only after compositing the frame
+into the page, about half a second after the frame first paints (Chrome 157).
+Until then the click lands on the page behind it, and no CDP event marks the
+moment.
 `true` means only that input was dispatched. Verify the original URL and real
 content returned; a redirect can still be loading. Google may re-challenge
 after the redirect: allow about three attempts, then stop and keep the browser

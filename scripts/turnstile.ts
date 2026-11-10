@@ -1,3 +1,4 @@
+import { pressAt } from "./input";
 import type { Evaluate, Send } from "./probe";
 
 // Page function: the checkbox point of a visible, uncovered Cloudflare
@@ -59,20 +60,6 @@ export async function clickTurnstileCheckbox({
   // Land near the measured point instead of on it every time, like the
   // published pure-CDP Turnstile solvers do.
   const jitter = () => Math.floor(Math.random() * 7) - 3;
-  await send("Input.dispatchMouseEvent", {
-    type: "mouseMoved",
-    x: point.x + jitter(),
-    y: point.y + jitter(),
-  });
-  const click = {
-    x: point.x + jitter(),
-    y: point.y + jitter(),
-    button: "left",
-    clickCount: 1,
-  } as const;
-  await send("Input.dispatchMouseEvent", { type: "mousePressed", ...click });
-  // A human holds a button: an instant press-release dwell would be a tell.
-  await new Promise((resolve) => setTimeout(resolve, 50 + Math.random() * 50));
-  await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...click });
+  await pressAt(send, { x: point.x + jitter(), y: point.y + jitter() });
   return true;
 }
