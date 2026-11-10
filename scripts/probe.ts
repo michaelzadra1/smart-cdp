@@ -24,6 +24,7 @@ import {
 } from "./chrome";
 import { clickRecaptchaCheckbox } from "./recaptcha";
 import type { RelayConfig, RelayState, RelayStatus } from "./relay";
+import { clickTurnstileCheckbox } from "./turnstile";
 
 type Commands = ProtocolMappingApi.Commands;
 
@@ -53,6 +54,7 @@ export type ProbeContext = {
   evaluate: Evaluate;
   waitFor: WaitFor;
   clickRecaptchaCheckbox: () => Promise<boolean>;
+  clickTurnstileCheckbox: () => Promise<boolean>;
 };
 
 export type Probe = (context: ProbeContext) => Promise<unknown>;
@@ -94,7 +96,8 @@ open (idle exit after 5 minutes), so Chrome asks to allow debugging only once.
 CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
-Context: { cdp, send, sessionId, targetId, evaluate, waitFor, clickRecaptchaCheckbox }
+Context: { cdp, send, sessionId, targetId, evaluate, waitFor,
+  clickRecaptchaCheckbox, clickTurnstileCheckbox }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments.
 waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) re-evaluates fn until
@@ -744,6 +747,7 @@ export async function runProbe(
       evaluate,
       waitFor,
       clickRecaptchaCheckbox: () => clickRecaptchaCheckbox({ send, evaluate }),
+      clickTurnstileCheckbox: () => clickTurnstileCheckbox({ send, evaluate }),
     };
     const run =
       typeof snippet === "string"
