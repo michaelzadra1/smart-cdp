@@ -808,6 +808,103 @@ test("clicks only a visible normal-size reCAPTCHA checkbox", async () => {
   }
 }, 30000);
 
+test("clicks only a visible Cloudflare Turnstile widget", async () => {
+  // A real widget box: the hidden response input's parent div, with the
+  // challenges.cloudflare.com checkbox iframe inside it. A 300x65 box puts
+  // the clickable point at +30px from the left, vertically centered.
+  const widget = (inner: string) =>
+    `<div style="position:absolute;left:40px;top:60px;width:300px;height:65px">
+      <input name="cf-turnstile-response" type="hidden">${inner}</div>`;
+  const frames = {
+    iframe: `<iframe src="https://challenges.cloudflare.com/turnstile/v0/site/test/none/normal/fbE/new/hidden"
+      style="border:0;width:100%;height:100%"></iframe>`,
+  };
+  const pages: Record<string, string> = {
+    // Standard layout: the response input's parent is the widget box.
+    "/widget": widget(frames.iframe),
+    // A custom wrapper that renders no marker input: only the widget iframe
+    // is there to find.
+    "/unmarked": `<iframe src="https://challenges.cloudflare.com/turnstile/v0/site/test/none/normal/fbE/new/hidden"
+      style="border:0;position:absolute;left:40px;top:60px;width:300px;height:65px"></iframe>`,
+    // A foreign overlay over the box must not be clicked through.
+    "/covered": `${widget(frames.iframe)}<div style="position:absolute;left:40px;top:60px;width:300px;height:65px"></div>`,
+  };
+  const server = await serve((req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end(
+      `${pages[req.url ?? ""]}<script>addEventListener("message", e => { if (e.data === "painted") window.painted = true; else document.title = e.data; })</script>`
+    );
+  });
+  const anchor = Buffer.from(
+    "<script>onmousedown = () => parent.postMessage('clicked', '*');" +
+      "requestAnimationFrame(() => requestAnimationFrame(() => parent.postMessage('painted', '*')))</script>"
+  ).toString("base64");
+  try {
+    const results = await runProbe(
+      parseOptions(["--once", "--headless"]),
+      async ({
+        cdp,
+        send,
+        sessionId,
+        evaluate,
+        waitFor,
+        clickTurnstileCheckbox,
+      }) => {
+        cdp.on("Fetch.requestPaused", ({ requestId }) =>
+          cdp.Fetch.fulfillRequest({
+            requestId,
+            responseCode: 200,
+            responseHeaders: [{ name: "Content-Type", value: "text/html" }],
+            body: anchor,
+          })
+        );
+        await cdp.Fetch.enable({
+          patterns: [{ urlPattern: "https://challenges.cloudflare.com/*" }],
+        });
+        await send("Page.enable");
+        const results: Record<string, { clicked: boolean; title: string }> = {};
+        for (const path of Object.keys(pages)) {
+          const loaded = new Promise((resolve) =>
+            (cdp as unknown as EventEmitter).once(
+              `Page.loadEventFired.${sessionId}`,
+              resolve
+            )
+          );
+          await send("Page.navigate", {
+            url: `http://127.0.0.1:${portOf(server)}${path}`,
+          });
+          await loaded;
+          await waitFor(
+            () => (window as unknown as { painted?: boolean }).painted
+          );
+          const clicked = await clickTurnstileCheckbox();
+          const title = await evaluate(
+            (wait: number) =>
+              new Promise<string>((resolve) => {
+                const end = Date.now() + wait;
+                const check = () =>
+                  document.title || Date.now() >= end
+                    ? resolve(document.title)
+                    : setTimeout(check, 50);
+                check();
+              }),
+            clicked ? 1000 : 0
+          );
+          results[path] = { clicked, title };
+        }
+        return results;
+      }
+    );
+    expect(results).toEqual({
+      "/widget": { clicked: true, title: "clicked" },
+      "/unmarked": { clicked: true, title: "clicked" },
+      "/covered": { clicked: false, title: "" },
+    });
+  } finally {
+    await close(server);
+  }
+}, 30000);
+
 test('a "Leave site?" dialog cannot block navigation', async () => {
   const server = await serve((req, res) => {
     res.setHeader("Content-Type", "text/html");
