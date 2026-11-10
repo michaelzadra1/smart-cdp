@@ -63,6 +63,11 @@ async function expectCleaned(result: { stderr: string }) {
   expect(owned, result.stderr).not.toBeNull();
   const [, pid = "", profile = ""] = owned ?? [];
   expect(alive(Number(pid))).toBe(false);
+  // A Chrome helper that outlives its browser can recreate the profile.
+  const processes = await new Response(
+    Bun.spawn(["ps", "-axo", "command="]).stdout
+  ).text();
+  expect(processes).not.toContain(profile);
   expect(await exists(profile)).toBe(false);
 }
 

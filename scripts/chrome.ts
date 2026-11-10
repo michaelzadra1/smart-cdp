@@ -198,7 +198,8 @@ export async function launchChrome({
       ...(headless ? ["--headless=new"] : []),
       "--no-startup-window",
     ],
-    { stdio: "ignore" }
+    // Its own process group, so stopChrome can reach the helpers too.
+    { stdio: "ignore", detached: true }
   );
   let spawnError: Error | undefined;
   const chrome: Chrome = {
@@ -266,5 +267,10 @@ export async function stopChrome(
     if (chrome.running()) chrome.child.kill("SIGKILL");
     await chrome.exited;
   }
+  // A browser killed by a signal orphans its helpers, and a surviving one can
+  // recreate the profile after rm. Puppeteer kills the group the same way.
+  try {
+    if (chrome.child.pid) process.kill(-chrome.child.pid, "SIGKILL");
+  } catch {}
   if (!chrome.kept) await rm(chrome.profile, { recursive: true, force: true });
 }
