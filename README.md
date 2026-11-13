@@ -44,6 +44,15 @@ Name the profile in your prompt the way Chrome's profile menu shows it, such
 as "Alex (Work)" or just "Work". The extension uses `chrome.debugger` on the
 one tab it opens, so Chrome shows no "Allow remote debugging?" prompt.
 
+### Reading a desktop app (Slack and other Electron apps)
+
+Ask explicitly, for example "read my Slack and list my channels". The agent
+copies the app's profile and opens a hidden copy of the app beside yours,
+which keeps running untouched. That session is read-only: it can read and take
+screenshots, but it cannot click, type or navigate. Releasing it quits the copy
+and deletes its profile. Needs no setup. See
+[DESKTOP-APPS.md](references/DESKTOP-APPS.md).
+
 ### WebFetch fallback hook (optional, Claude Code)
 
 [SKILL.md](SKILL.md#webfetch-fallback-hook) has a hook that sends the agent

@@ -9,12 +9,14 @@ description: >-
   calls per run, or one that gets rate-limited or blocked under load. Each
   agent claims its own isolated Chrome and releases it when done; when the
   user asks to use their own Chrome or existing signed-in profile, it drives a
-  tab there through a bundled extension, with no remote-debugging prompt. Prefer a
+  tab there through a bundled extension, with no remote-debugging prompt. When
+  the user explicitly asks to read a desktop Electron app such as Slack, it
+  reads a hidden, read-only copy of that app. Prefer a
   repository-specific browser skill when reproducing that repository's
   production runtime or infrastructure.
 metadata:
   author: Michael Zadra
-  version: "6.2.0"
+  version: "6.3.0"
 ---
 
 # Smart CDP
@@ -148,6 +150,35 @@ this. In a `--personal` probe, `cdp` reaches only that tab: there is no
 passkey requests fail at once, so the profile's own passkey sheet never covers
 the page. See [LIFECYCLE.md](references/LIFECYCLE.md#your-own-chrome-profile).
 
+## Desktop apps (Electron)
+
+Use this only when the user explicitly asks to read or control a desktop app
+such as Slack, Discord, VS Code, Notion or Figma; never as a route to a site
+that also has a web version. Claim with `--app "<the app's name>"` and pass
+the same `--app` on every later probe in that session:
+
+```bash
+bun "$SMART_CDP_SKILL/scripts/probe.ts" --app Slack <<'JS'
+return await evaluate(() => ({ url: location.href, title: document.title }));
+JS
+```
+
+The probe starts a hidden copy of the app, signed in on a copy of its
+profile, and binds its main window; the user's own app keeps running
+untouched. The copy opens on the view the app last saved. `--end-session`
+quits the copy and deletes its profile.
+
+**Read-only for now.** The session refuses input (`click`, `type`, `press`),
+navigation, reloads, request interception, answering dialogs and opening or
+closing windows. Read with `evaluate`, `waitFor`, DOM and `Accessibility`
+queries, screenshots and network events. Probe code must not act through page
+JavaScript either: no posting, reacting, marking read, or changing settings
+or drafts, and no API call that writes. Report what the app shows, and ask the
+user before any change that reading alone cannot do. To read a view the copy is
+not showing, read the data the page already holds, such as its IndexedDB or
+local storage. See [DESKTOP-APPS.md](references/DESKTOP-APPS.md) for how a
+session works, its limits and a Slack recipe.
+
 ## WebFetch fallback hook
 
 `scripts/webfetch-fallback.ts` tells any agent or subagent to open a page here
@@ -210,7 +241,8 @@ pacing to rate meters, request blocking and how to measure a speed change.
   `Target.activateTarget`, `Page.bringToFront` and `background: false` make
   Chrome the frontmost app. To hide a tab, minimize its window with
   `Browser.setWindowBounds`, which leaves focus where it is.
-- Drive the user's own profile only when they ask for it, with `--personal`.
+- Drive the user's own profile only when they ask for it, with `--personal`,
+  and read a desktop app only when they ask for it, with `--app`.
   Attach to an existing browser only when the user or task owns that endpoint.
   Attachments share one approved connection, so Chrome asks only once per
   Chrome run; see [LIFECYCLE.md](references/LIFECYCLE.md#authorized-existing-browser).

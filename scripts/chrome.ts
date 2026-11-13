@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { browserEndpoint, connect } from "./cdp";
 
+/** A launched Chrome, or Electron app, that this process owns. */
 export type Chrome = {
   child: ChildProcess;
   profile: string;
@@ -56,7 +57,8 @@ const CHROME_USER_DATA_DIR = join(
   "Library/Application Support/Google/Chrome"
 );
 
-const normalize = (label: string) =>
+/** A name as people match it: ignoring case and punctuation. */
+export const normalize = (label: string) =>
   label
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
@@ -167,36 +169,69 @@ export async function launchChrome({
   profile?: string;
   log?: (line: string) => void;
 }): Promise<Chrome> {
-  const kept = Boolean(keptProfile);
   const makeProfile = async () => {
     if (!keptProfile) return mkdtemp(join(tmpdir(), "smart-cdp-"));
     const path = resolve(keptProfile);
     await mkdir(path, { recursive: true });
     return path;
   };
-  const [binary, port, profile] = await Promise.all([
-    chromeBinary(),
-    reserveLoopbackPort(),
-    makeProfile(),
-  ]);
+  const [binary, profile] = await Promise.all([chromeBinary(), makeProfile()]);
   await disablePasswordManager(profile);
+  return launchBrowser({
+    name: "Chrome",
+    binary,
+    profile,
+    kept: Boolean(keptProfile),
+    args: [
+      "--no-first-run",
+      "--no-default-browser-check",
+      ...(headless ? ["--headless=new"] : []),
+      "--no-startup-window",
+    ],
+    log,
+  });
+}
+
+/**
+ * Spawns a Chromium-based executable (Chrome, or an Electron app) as this
+ * process's child on `profile`, with CDP on a reserved loopback port, and
+ * proves the endpoint belongs to that child. The returned handle is the only
+ * cleanup authority: stop it with stopChrome.
+ */
+export async function launchBrowser({
+  name,
+  binary,
+  profile,
+  kept = false,
+  args = [],
+  log,
+  onSpawn,
+}: {
+  /** What log lines and errors call it: "Chrome", or the app's name. */
+  name: string;
+  binary: string;
+  profile: string;
+  /** A profile the caller keeps; otherwise stopChrome removes it. */
+  kept?: boolean;
+  args?: string[];
+  log?: (line: string) => void;
+  onSpawn?: (pid: number) => void;
+}): Promise<Chrome> {
+  const port = await reserveLoopbackPort();
   const child = spawn(
     binary,
     [
       "--remote-debugging-address=127.0.0.1",
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${profile}`,
-      "--no-first-run",
-      "--no-default-browser-check",
       // A window behind the user's must work like a front one: without these,
-      // Chrome throttles a covered window's renderer and its timers, and on a
-      // loaded machine delays or drops the input a probe sends it. Puppeteer
-      // launches with the same three.
+      // Chromium throttles a covered or hidden window's renderer and its
+      // timers, and on a loaded machine delays or drops the input a probe
+      // sends it. Puppeteer launches with the same three.
       "--disable-backgrounding-occluded-windows",
       "--disable-renderer-backgrounding",
       "--disable-background-timer-throttling",
-      ...(headless ? ["--headless=new"] : []),
-      "--no-startup-window",
+      ...args,
     ],
     // Its own process group, so stopChrome can reach the helpers too.
     { stdio: "ignore", detached: true }
@@ -215,13 +250,14 @@ export async function launchChrome({
     }),
     running: () => child.exitCode === null && child.signalCode === null,
   };
-  log?.(`Owned Chrome pid=${child.pid} profile=${profile}`);
+  if (child.pid) onSpawn?.(child.pid);
+  log?.(`Owned ${name} pid=${child.pid} profile=${profile}`);
   try {
     while (!chrome.endpoint) {
       if (spawnError) throw spawnError;
       if (!chrome.running())
         throw new Error(
-          "Chrome exited before CDP became ready (profile already open?)"
+          `${name} exited before CDP became ready (profile already open?)`
         );
       try {
         chrome.endpoint = await browserEndpoint(port);
@@ -246,7 +282,8 @@ export async function launchChrome({
 }
 
 /**
- * Stops a launched Chrome and removes its generated profile, never a kept one.
+ * Stops a launched Chrome or app and removes its generated profile, never a
+ * kept one.
  * Browser.close is a graceful shutdown: it flushes cookies to disk, which a
  * signal can drop (a fresh sign-in vanishes on the next launch).
  */
