@@ -8,12 +8,14 @@ import {
   launchChrome,
   stopChrome,
 } from "./chrome";
+import { type ElectronApp, launchApp } from "./electron";
 
 // A detached process that holds one CDP connection for the probes after it.
 // Attachment: Chrome 144+ asks the user to allow every new CDP WebSocket to a
 // personal browser, so attached probes share this one approved connection.
-// Session: it launches and owns a Chrome, so the browser and its tab outlive
-// each probe until --end-session or the idle timeout closes them.
+// Session: it launches and owns a Chrome, or a read-only copy of an Electron
+// app (electron.ts), so the browser and its tab outlive each probe until
+// --end-session or the idle timeout closes them.
 // Each client gets its own browser session, so detaching it on disconnect
 // clears that client's browser-level state as closing a connection would.
 
@@ -21,6 +23,10 @@ export type RelayConfig = {
   endpoint?: string;
   session?: string;
   launch?: { headless: boolean; profile?: string };
+  /** A copy of this Electron app, launched on a copy of its profile. */
+  app?: ElectronApp;
+  /** Refuse the commands in READ_ONLY_REFUSED; app sessions set it, for now. */
+  readOnly?: boolean;
   /** A tab in this one of the user's own Chrome profiles, hosted by personal.ts. */
   personal?: ChromeProfile;
   /** Hand focus back to the tab the user was on once the personal tab opens. */
@@ -39,6 +45,7 @@ export type RelayState = {
   keptProfile?: boolean;
   headless?: boolean;
   personal?: ChromeProfile;
+  app?: ElectronApp;
   /** A personal tab's session ID: the host routes it to the tab itself. */
   sessionId?: string;
   idleMs?: number;
@@ -49,6 +56,14 @@ export type RelayState = {
  * status of a refused upgrade, so a refused probe asks here why.
  */
 export type RelayStatus = { busy: boolean; closing: boolean };
+
+// A read-only session refuses the commands that act on the page, as input,
+// navigation, request interception, answering a dialog and opening or
+// closing windows do, and leaves reading (evaluate, DOM, screenshots, network
+// events) to the probe. Page JavaScript can still act, so read-only is a rule
+// for probe code too (SKILL.md, Desktop apps).
+const READ_ONLY_REFUSED =
+  /^(?:Input|Fetch)\.|^Page\.(?:navigate|navigateToHistoryEntry|reload|close|setDocumentContent|handleJavaScriptDialog)$|^Target\.(?:createTarget|closeTarget)$|^Browser\.close$/;
 
 type Command = {
   id?: number;
@@ -153,6 +168,16 @@ const forward = (client: Socket, data: string) => {
   const { browserSession } = client.data;
   if (!browserSession) return;
   const { id, ...command } = JSON.parse(data) as Command;
+  if (config.readOnly && READ_ONLY_REFUSED.test(command.method))
+    return client.send(
+      JSON.stringify({
+        id,
+        error: {
+          code: -32000,
+          message: `${command.method} is refused: this session is read-only`,
+        },
+      })
+    );
   command.sessionId ??= browserSession;
   send(command, { client, id, browserSession });
 };
@@ -164,6 +189,7 @@ process.on("unhandledRejection", (error) => void shutdown(error));
 
 try {
   if (config.launch) chrome = await launchChrome(config.launch);
+  if (config.app) chrome = await launchApp(config.app);
 } catch (error) {
   await shutdown(error);
 }
@@ -208,13 +234,31 @@ upstream.addEventListener("message", (event) => {
   owner.client.send(JSON.stringify(message));
 });
 
+// The session's tab in an app is its main window: the first page that is not
+// DevTools, which an app opens a moment after CDP is ready.
+async function appWindow() {
+  for (const deadline = Date.now() + 30_000; Date.now() < deadline; ) {
+    const { result } = await call({ method: "Target.getTargets" });
+    const { targetInfos = [] } = (result ?? {}) as {
+      targetInfos?: { targetId: string; type: string; url: string }[];
+    };
+    const page = targetInfos.find(
+      ({ type, url }) => type === "page" && !url.startsWith("devtools://")
+    );
+    if (page) return page.targetId;
+    await delay(250);
+  }
+  throw new Error(`${config.app?.name} opened no window within 30 seconds`);
+}
+
 upstream.addEventListener(
   "open",
   async () => {
     try {
       const path = `/${randomUUID()}`;
       let targetId: string | undefined;
-      if (chrome) {
+      if (config.app) targetId = await appWindow();
+      else if (chrome) {
         // The session's tab: every probe in the session continues on it.
         const { result, error } = await call({
           method: "Target.createTarget",
@@ -291,6 +335,7 @@ upstream.addEventListener(
           profile: chrome.profile,
           keptProfile: chrome.kept,
           headless: Boolean(config.launch?.headless),
+          app: config.app,
           idleMs,
         }),
       };

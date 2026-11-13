@@ -71,6 +71,9 @@ Chrome: the next probe or `--end-session` with that ID closes it only when the
 recorded browser endpoint, unique to that launch, still answers with the
 recorded PID; otherwise it reports the PID and profile and leaves them.
 
+An `--app` session claims the same way, but its host launches a hidden copy
+of a desktop app instead of Chrome; see [DESKTOP-APPS.md](DESKTOP-APPS.md).
+
 This is the split Puppeteer draws between
 [`disconnect()` and `close()`](https://github.com/puppeteer/puppeteer/blob/main/packages/puppeteer-core/src/cdp/Browser.ts)
 (`Browser.close`, then the process is killed if that fails), and how

@@ -20,8 +20,10 @@ import {
   chromeProfile,
   DEFAULT_PROFILE,
   launchChrome,
+  normalize,
   stopChrome,
 } from "./chrome";
+import { electronApp } from "./electron";
 import { inPageCall, returnByValueInPage } from "./in-page";
 import { clickPointInPage, type Point, press, pressAt, type } from "./input";
 import { holdPressAndHoldButton, type PressAndHoldResult } from "./press-hold";
@@ -107,12 +109,17 @@ const usage = `Usage: bun <skill>/scripts/probe.ts [options] < probe.js
                          by directory ("Profile 2")
   --background           With a --personal claim: give focus back to the tab
                          the user was on, and drive this one behind it
+  --app <name>           Read an Electron desktop app such as Slack: a hidden copy
+                         of the app on a copy of its profile, read-only. Only
+                         when the user explicitly asks to read that app
   --help
 
 By default a probe claims a new isolated Chrome, prints its ID, and leaves it
 open: pass --session <id> to continue and --end-session <id> when done.
 A --personal browser is a tab the extension drives; --end-session closes only
 that tab, and cdp reaches only that tab (no Browser or Target domain).
+An --app session binds the app's main window; it refuses input, navigation and
+request interception, and --end-session quits the copy and deletes its profile.
 Attachment goes through a per-browser relay that keeps one approved connection
 open (idle exit after 5 minutes), so Chrome asks to allow debugging only once.
 CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
@@ -147,6 +154,7 @@ export function parseOptions(args: string[]) {
       personal: { type: "boolean" },
       "personal-profile": { type: "string" },
       background: { type: "boolean" },
+      app: { type: "string" },
       "timeout-ms": { type: "string", default: "120000" },
       "ws-url": { type: "string" },
       port: { type: "string" },
@@ -191,16 +199,20 @@ export function parseOptions(args: string[]) {
   }
   const personal =
     Boolean(values.personal) || values["personal-profile"] !== undefined;
-  if (
-    personal &&
-    (values.once ||
-      values.headless ||
-      values.profile ||
-      endpoints.length ||
-      values.target)
-  )
+  // Options that shape a launched Chrome or an attachment.
+  const chromeOnly =
+    values.once ||
+    values.headless ||
+    values.profile ||
+    endpoints.length ||
+    values.target;
+  if (personal && chromeOnly)
     throw new Error(
       "--personal drives a tab in your own Chrome profile; it takes no --once, --headless, --profile or attachment options"
+    );
+  if (values.app !== undefined && (personal || chromeOnly))
+    throw new Error(
+      "--app launches a copy of a desktop app; it takes no --personal, --once, --headless, --profile or attachment options"
     );
   if (values.background && !personal)
     throw new Error("--background applies only to a --personal tab");
@@ -375,11 +387,24 @@ async function sessionState(options: ProbeOptions) {
   if (recorded && !live) await closeOrphan(name, recorded);
   if (live) {
     const profile = options.profile && resolve(options.profile);
-    if (Boolean(options.personal) !== Boolean(live.personal))
+    const kind = (s: { personal?: unknown; app?: unknown }) =>
+      s.personal ? "personal" : s.app ? "app" : "chrome";
+    if (kind(options) !== kind(live))
       throw new Error(
         live.personal
           ? `Session ${name} is a tab in your own Chrome: pass --personal to continue in it`
-          : `Session ${name} is an isolated Chrome: leave out --personal to continue in it`
+          : live.app
+            ? `Session ${name} is a read-only copy of ${live.app.name}: pass --app "${live.app.name}" to continue in it`
+            : `Session ${name} is an isolated Chrome: leave out ${options.personal ? "--personal" : "--app"} to continue in it`
+      );
+    if (
+      live.app &&
+      options.app &&
+      normalize(options.app) !== normalize(live.app.name)
+    )
+      throw new Error(
+        `Session ${name} is a copy of ${live.app.name}. To use ${options.app}, ` +
+          `release it with --end-session ${name} or use another name`
       );
     const wanted = options["personal-profile"];
     if (
@@ -414,14 +439,21 @@ async function sessionState(options: ProbeOptions) {
           background: Boolean(options.background),
           idleMs: options.idle,
         }
-      : {
-          session: name,
-          launch: {
-            headless: Boolean(options.headless),
-            profile: options.profile,
-          },
-          idleMs: options.idle,
-        }
+      : options.app
+        ? {
+            session: name,
+            app: await electronApp(options.app),
+            readOnly: true,
+            idleMs: options.idle,
+          }
+        : {
+            session: name,
+            launch: {
+              headless: Boolean(options.headless),
+              profile: options.profile,
+            },
+            idleMs: options.idle,
+          }
   );
   const idleMs = state.idleMs ?? 0;
   const [amount, unit] =
@@ -431,7 +463,9 @@ async function sessionState(options: ProbeOptions) {
     : "";
   const what = state.personal
     ? `a tab in your Chrome's ${state.personal.name} profile`
-    : `Chrome pid=${state.chromePid} profile=${state.profile}`;
+    : state.app
+      ? `a hidden, read-only copy of ${state.app.name} pid=${state.chromePid} profile=${state.profile}`
+      : `Chrome pid=${state.chromePid} profile=${state.profile}`;
   console.error(
     `Claimed browser ${name}: ${what}. ` +
       `Continue with --session ${name}; release it with --end-session ${name} when done.${idle}`
@@ -872,6 +906,10 @@ async function main() {
     if (state?.personal)
       console.error(
         `Released browser ${state.session}: closed its tab in your Chrome`
+      );
+    else if (state?.app)
+      console.error(
+        `Released browser ${state.session}: quit the copy of ${state.app.name} pid=${state.chromePid} and removed ${state.profile}`
       );
     else if (state)
       console.error(

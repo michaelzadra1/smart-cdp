@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServerWebSocket } from "bun";
 import type { CdpClient } from "./cdp";
+import { chromeBinary } from "./chrome";
 import {
   activePortEndpoint,
   isAlive as alive,
@@ -131,6 +132,11 @@ test("validates attachment boundaries and DevToolsActivePort", () => {
     ["--personal", "--port", "9222", "--target", "t"],
     ["--personal-profile", "Work", "--once"],
     ["--background"],
+    ["--app", "Slack", "--personal"],
+    ["--app", "Slack", "--once"],
+    ["--app", "Slack", "--headless"],
+    ["--app", "Slack", "--profile", "/tmp/p"],
+    ["--app", "Slack", "--port", "9222", "--target", "t"],
   ])
     expect(() => parseOptions(args)).toThrow();
   expect(parseOptions(["--port", "9222", "--target", "x"]).target).toBe("x");
@@ -638,6 +644,127 @@ test("a personal session drives one extension tab until released", async () => {
   }
   await rm(directory, { recursive: true, force: true });
 }, 30000);
+
+test("an app session reads a hidden copy of an Electron app until released", async () => {
+  const home = await mkdtemp(join(tmpdir(), "smart-cdp-app-test-"));
+  const server = await serve((_req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end("<title>Fixture App</title><h1>Signed in</h1>");
+  });
+  // A stand-in Electron app in ~/Applications whose executable is Chrome,
+  // headless so that it opens no window: a test must not take the user's
+  // focus, and only the hide watcher keeps a real app's window from doing so.
+  // It inherits the stub HOME, where macOS finds no keychain and asks the user
+  // to reset theirs: the mock keychain keeps Chrome away from the Keychain.
+  const bundle = join(home, "Applications/Smart CDP Fixture.app/Contents");
+  await mkdir(join(bundle, "Frameworks/Electron Framework.framework"), {
+    recursive: true,
+  });
+  await mkdir(join(bundle, "MacOS"));
+  await mkdir(join(home, "Applications/Plain.app/Contents"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(bundle, "Info.plist"),
+    `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>fixture</string>
+<key>CFBundleName</key><string>Fixture Data</string>
+</dict></plist>`
+  );
+  await writeFile(
+    join(bundle, "MacOS/fixture"),
+    `#!/bin/bash\nexec "${await chromeBinary()}" --headless=new --use-mock-keychain --no-first-run --no-default-browser-check "$@" "http://127.0.0.1:${portOf(server)}/"\n`
+  );
+  await chmod(join(bundle, "MacOS/fixture"), 0o755);
+  // The app's profile: signed-in state, a cache and a link to leave behind.
+  const data = join(home, "Library/Application Support/Fixture Data");
+  await mkdir(join(data, "Cache"), { recursive: true });
+  await mkdir(join(data, "state"));
+  await writeFile(join(data, "state/session.json"), "signed in");
+  await writeFile(join(data, "Cache/entry"), "cached");
+  await mkdir(join(data, "Service Worker/CacheStorage"), { recursive: true });
+  await mkdir(join(data, "Service Worker/Database"));
+  await writeFile(join(data, "Service Worker/CacheStorage/entry"), "cached");
+  await writeFile(join(data, "Service Worker/Database/entry"), "registered");
+  await symlink("host-1234", join(data, "fixture-link"));
+  const env = { HOME: home };
+  const run = (code: string, args: string[]) => cli(code, args, probe, [], env);
+  let id: string | undefined;
+  try {
+    const [unknown, plain] = await Promise.all([
+      run("return 1;", ["--app", "No Such App"]),
+      run("return 1;", ["--app", "plain"]),
+    ]);
+    expect(unknown.stderr).toMatch(
+      /No app named "No Such App" in \/Applications or .+\. Electron apps installed: .*Smart CDP Fixture/
+    );
+    expect(plain.stderr).toMatch(/Plain is not an Electron app/);
+    const claimed = await run(
+      `const attempt = (fn) => fn().then(() => "allowed", (e) => e.message);
+       return {
+         title: await waitFor(() => document.title),
+         press: await attempt(() => press("Enter")),
+         navigate: await attempt(() => send("Page.navigate", { url: "about:blank" })),
+         screenshot: (await send("Page.captureScreenshot")).data.length > 0,
+       };`,
+      ["--app", "smart cdp fixture"]
+    );
+    expect(claimed.status, claimed.stderr).toBe(0);
+    const [, name, pid, copy = ""] =
+      /Claimed browser (b-[0-9a-f]{6}): a hidden, read-only copy of Smart CDP Fixture pid=(\d+) profile=(\S+)\. /.exec(
+        claimed.stderr
+      ) ?? [];
+    id = name;
+    expect(id, claimed.stderr).toBeDefined();
+    expect(JSON.parse(claimed.stdout)).toEqual({
+      title: "Fixture App",
+      press: "Input.dispatchKeyEvent is refused: this session is read-only",
+      navigate: "Page.navigate is refused: this session is read-only",
+      screenshot: true,
+    });
+    expect(await readFile(join(copy, "state/session.json"), "utf8")).toBe(
+      "signed in"
+    );
+    expect(await exists(join(copy, "Cache/entry"))).toBe(false);
+    expect(
+      await readFile(join(copy, "Service Worker/Database/entry"), "utf8")
+    ).toBe("registered");
+    expect(await exists(join(copy, "Service Worker/CacheStorage/entry"))).toBe(
+      false
+    );
+    expect(await exists(join(copy, "fixture-link"))).toBe(false);
+    const [next, withoutApp] = await Promise.all([
+      run("return await evaluate(() => location.pathname);", [
+        "--session",
+        id ?? "",
+        "--app",
+        "Smart CDP Fixture",
+      ]),
+      run("return 1;", ["--session", id ?? ""]),
+    ]);
+    expect(next.status, next.stderr).toBe(0);
+    expect(JSON.parse(next.stdout)).toBe("/");
+    expect(withoutApp.stderr).toMatch(
+      /is a read-only copy of Smart CDP Fixture: pass --app "Smart CDP Fixture" to continue in it/
+    );
+    const released = await run("", ["--end-session", id ?? ""]);
+    id = undefined;
+    expect(released.stderr).toMatch(
+      new RegExp(
+        `quit the copy of Smart CDP Fixture pid=${pid} and removed ${copy}`
+      )
+    );
+    expect(alive(Number(pid))).toBe(false);
+    expect(await exists(copy)).toBe(false);
+    // The app's own profile is never changed.
+    expect(await exists(join(data, "Cache/entry"))).toBe(true);
+  } finally {
+    if (id) await run("", ["--end-session", id]);
+    await close(server);
+    await rm(home, { recursive: true, force: true });
+  }
+}, 60000);
 
 test("a session keeps Chrome and its tab across probes until ended", async () => {
   const server = await serve((req, res) => {
