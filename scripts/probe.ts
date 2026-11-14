@@ -21,10 +21,19 @@ import {
   DEFAULT_PROFILE,
   launchChrome,
   normalize,
+  profileDownloads,
   stopChrome,
+  trackDownload,
 } from "./chrome";
 import { electronApp } from "./electron";
-import { inPageCall, returnByValueInPage } from "./in-page";
+import {
+  changedInPage,
+  inPageCall,
+  returnByValueInPage,
+  stopWatchInPage,
+  type WatchResult,
+  watchInPage,
+} from "./in-page";
 import { clickPointInPage, type Point, press, pressAt, type } from "./input";
 import { holdPressAndHoldButton, type PressAndHoldResult } from "./press-hold";
 import { clickRecaptchaCheckbox } from "./recaptcha";
@@ -130,8 +139,9 @@ Context: { cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
-waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) re-evaluates fn until
-it returns a truthy value, surviving redirects and reloads; throws on timeout.
+waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) returns fn's first truthy
+value: the page re-checks fn on every DOM change and page event, and the host
+polls it every intervalMs, surviving redirects and reloads; throws on timeout.
 click(selector | fn, { args, timeoutMs, intervalMs }) presses the element once it
 is visible and uncovered; type(text) types into the focused element; press(key)
 presses one key such as "Enter". All three send trusted input, unlike el.click().
@@ -603,7 +613,13 @@ export async function runProbe<T = unknown>(
         );
       const client = cdp;
       if (chrome)
-        await stopChrome(chrome, client && (() => client.Browser.close()));
+        await stopChrome(
+          chrome,
+          client && {
+            cancelDownload: (guid) => client.Browser.cancelDownload({ guid }),
+            close: () => client.Browser.close(),
+          }
+        );
       await client?.close().catch(() => {});
     })();
     return cleaning;
@@ -672,6 +688,16 @@ export async function runProbe<T = unknown>(
       throw error;
     }
     const client = cdp;
+    if (chrome) {
+      const launched = chrome;
+      client.on("Browser.downloadWillBegin", (event) =>
+        trackDownload(launched, event)
+      );
+      client.on("Browser.downloadProgress", (event) =>
+        trackDownload(launched, event)
+      );
+      await client.Browser.setDownloadBehavior(profileDownloads(launched));
+    }
     // Without this, a lost browser reads as a hang until the probe deadline.
     void client.closed.then(async () => {
       if (closing) return;
@@ -779,7 +805,9 @@ export async function runProbe<T = unknown>(
       evaluateAttempt: () => Promise<unknown>,
       options: PollOptions<unknown[]>,
       done: (value: unknown) => boolean,
-      explain: (last: unknown, lastError?: string) => string
+      explain: (last: unknown, lastError?: string) => string,
+      /** Ends the poll quietly, with undefined: something else answered. */
+      stopped?: AbortSignal
     ) => {
       const unknown = Object.keys(options).filter(
         (key) => !POLL_OPTIONS.includes(key)
@@ -794,6 +822,7 @@ export async function runProbe<T = unknown>(
       let last: unknown;
       let lastError: Error | undefined;
       for (;;) {
+        if (stopped?.aborted) return undefined;
         const attempt = evaluateAttempt();
         attempt.catch(() => {});
         try {
@@ -826,14 +855,91 @@ export async function runProbe<T = unknown>(
           explain(last, lastError?.message.split("\n")[0])
       );
     };
-    const waitFor: WaitFor = (fn, options = {}) =>
-      poll(
-        "waitFor",
-        () => evaluateValue(fn, options.args ?? ([] as never)),
-        options,
-        Boolean,
-        (_, error) => (error ? `; last error: ${error}` : "")
-      ) as Promise<never>;
+    // Settles with fn's first truthy value from the page, which re-checks it on
+    // every DOM change or page event (watchInPage), unless the host poll gets
+    // there first. A new document ends a watch, so it is watched again.
+    // Settles once the watch is over: with the value, or undefined once ended
+    // or impossible; throws ReturnedNodeError.
+    const watch = async <A extends unknown[]>(
+      fn: (...args: A) => unknown,
+      args: A,
+      ended: AbortSignal
+    ): Promise<{ value: unknown } | undefined> => {
+      while (!ended.aborted) {
+        let objectId: string | undefined;
+        const stop = () => {
+          if (objectId)
+            void send("Runtime.callFunctionOn", {
+              objectId,
+              functionDeclaration: String(stopWatchInPage),
+            }).catch(() => {});
+        };
+        try {
+          const handle = await send("Runtime.evaluate", {
+            expression: inPageCall(watchInPage, fn, args),
+          });
+          objectId = handle.result.objectId;
+          if (handle.exceptionDetails || !objectId) break;
+          ended.addEventListener("abort", stop, { once: true });
+          if (ended.aborted) stop();
+          const { result } = await send("Runtime.callFunctionOn", {
+            objectId,
+            functionDeclaration: String(changedInPage),
+            awaitPromise: true,
+            returnByValue: true,
+          });
+          const outcome: WatchResult = result.value;
+          if (outcome && "node" in outcome) throw new ReturnedNodeError();
+          if (outcome) return { value: outcome.value };
+          break;
+        } catch (error) {
+          if (error instanceof ReturnedNodeError) throw error;
+          if (
+            !(error instanceof CdpProtocolError) ||
+            !navigated.test(error.message)
+          )
+            break;
+          await delay(50);
+        } finally {
+          ended.removeEventListener("abort", stop);
+          if (objectId)
+            await send("Runtime.releaseObject", { objectId }).catch(() => {});
+        }
+      }
+      return undefined;
+    };
+    // Answers as the page changes, through watch; the host poll still covers
+    // what no event announces, such as script state or a page with scripts off.
+    const waitFor: WaitFor = async (fn, options = {}) => {
+      const args = options.args ?? ([] as never);
+      const ended = new AbortController();
+      const watching = watch(fn, args, ended.signal);
+      // Without a watch, as on a page with scripts off, the poll alone answers.
+      const changed = watching.then((found) =>
+        found ? found.value : new Promise<never>(() => {})
+      );
+      changed.catch(() => {});
+      try {
+        return (await Promise.race([
+          poll(
+            "waitFor",
+            () => evaluateValue(fn, args),
+            options,
+            Boolean,
+            (_, error) => (error ? `; last error: ${error}` : ""),
+            ended.signal
+          ),
+          changed,
+        ])) as never;
+      } finally {
+        // Let the watch end before the probe can, or its call reads as a hang.
+        ended.abort();
+        await Promise.race([
+          watching.catch(() => {}),
+          delay(1000, undefined, { ref: false }),
+        ]);
+      }
+    };
     const click: Click = async (target, options = {}) => {
       const [find, args, label] =
         typeof target === "string"

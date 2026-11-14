@@ -4,6 +4,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -11,7 +12,7 @@ import {
 } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ServerWebSocket } from "bun";
@@ -417,6 +418,65 @@ test("waitFor survives a page that replaces itself after load", async () => {
     expect(timedOut).toMatch(
       /^waitFor timed out after 300ms on http:.*\/landed; last error: Error: boom$/
     );
+  } finally {
+    await close(server);
+  }
+}, 30000);
+
+test("waitFor answers a DOM change as it happens and polls what no event announces", async () => {
+  const server = await serve((_req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end(
+      `<title>Watch</title><script>
+        setTimeout(() => { document.body.dataset.at = performance.now(); document.body.append(Object.assign(document.createElement("p"), { id: "late" })); }, 400);
+        setTimeout(() => { window.ready = true; }, 300);
+      </script>`
+    );
+  });
+  try {
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ cdp, send, sessionId, evaluate, waitFor }) => {
+        const page = pageLoaded(cdp, sessionId);
+        await send("Page.navigate", {
+          url: `http://127.0.0.1:${portOf(server)}`,
+        });
+        await page;
+        const globals = await evaluate(
+          () => Object.getOwnPropertyNames(window).length
+        );
+        // A 5-second poll: only the page's own report can answer within it.
+        await waitFor(() => Boolean(document.getElementById("late")), {
+          intervalMs: 5000,
+        });
+        const lag = await evaluate(
+          () => performance.now() - Number(document.body.dataset.at)
+        );
+        // Script state changes no DOM: the poll answers it.
+        const ready = await waitFor(() => Reflect.get(window, "ready"), {
+          intervalMs: 100,
+        });
+        const after = await evaluate(
+          () => Object.getOwnPropertyNames(window).length
+        );
+        // With scripts off the page reports nothing, and the poll still answers.
+        await send("Emulation.setScriptExecutionDisabled", { value: true });
+        const off = await waitFor(() => document.title, { timeoutMs: 2000 });
+        const offTimeout = await waitFor(
+          () => document.getElementById("never"),
+          {
+            timeoutMs: 300,
+          }
+        ).catch(message);
+        return { lag, ready, newGlobals: after - globals - 1, off, offTimeout };
+      }
+    );
+    // Well under the 5-second poll, with room for a loaded CPU.
+    expect(result.lag).toBeLessThan(1000);
+    expect(result.ready).toBe(true);
+    expect(result.newGlobals).toBe(0);
+    expect(result.off).toBe("Watch");
+    expect(result.offTimeout).toMatch(/^waitFor timed out after 300ms/);
   } finally {
     await close(server);
   }
@@ -1202,6 +1262,57 @@ test("holds a HUMAN Press & Hold button until the challenge completes", async ()
     expect(result.decoys).toBe(false);
   } finally {
     await close(server);
+  }
+}, 30000);
+
+test("a launched Chrome downloads into its profile and closes mid-download at once", async () => {
+  // A file still downloading when the probe ends, as a receipt link or an
+  // export button leaves behind.
+  const server = await serve((req, res) => {
+    if (req.url !== "/file") return res.end("<title>Home</title>");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="smart-cdp-slow.pdf"'
+    );
+    const timer = setInterval(() => res.write(Buffer.alloc(1000)), 200);
+    res.on("close", () => clearInterval(timer));
+  });
+  const profile = await mkdtemp(join(tmpdir(), "smart-cdp-downloads-"));
+  const userDownloads = join(homedir(), "Downloads");
+  const before = new Set(await readdir(userDownloads).catch(() => []));
+  try {
+    let ended = 0;
+    const saved = await runProbe(
+      parseOptions(["--once", "--profile", profile]),
+      async ({ cdp, send }) => {
+        const receiving = new Promise((resolve) =>
+          cdp.on("Browser.downloadProgress", ({ receivedBytes }) => {
+            if (receivedBytes > 0) resolve(receivedBytes);
+          })
+        );
+        await send("Page.navigate", {
+          url: `http://127.0.0.1:${portOf(server)}/file`,
+        }).catch(() => {});
+        await receiving;
+        const files = await readdir(join(profile, "Downloads"));
+        ended = Date.now();
+        return files;
+      }
+    );
+    // Without cancelling it first, Browser.close waits on Chrome's
+    // "Download is in progress" prompt until the kill, about 8 seconds.
+    expect(Date.now() - ended).toBeLessThan(3000);
+    expect(saved.some((name) => name.endsWith(".crdownload"))).toBe(true);
+    const added = (await readdir(userDownloads).catch(() => [])).filter(
+      (name) =>
+        !before.has(name) &&
+        /smart-cdp-slow|\.crdownload$|^\.com\.google\.Chrome\./.test(name)
+    );
+    expect(added).toEqual([]);
+  } finally {
+    await close(server);
+    await rm(profile, { recursive: true, force: true });
   }
 }, 30000);
 

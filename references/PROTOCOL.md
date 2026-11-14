@@ -20,10 +20,13 @@ with `CdpConnectionClosedError`.
 ## Navigate and extract
 
 Wait for the page state the next step needs. `waitFor(fn, { args, timeoutMs,
-intervalMs })` re-evaluates a page predicate from Node, every 250 ms for up to
-30 s by default, and returns its first truthy value. Each poll is a short
-evaluation, so a redirect, reload or bot check that replaces the document costs
-one retry. One long `evaluate`, such as an in-page polling loop, fails with
+intervalMs })` returns a page predicate's first truthy value, waiting up to 30 s
+by default. The page re-checks it on every DOM change and on hashchange,
+popstate, readystatechange, load and error events, so a state the DOM shows
+answers as it happens. Node also re-evaluates it every `intervalMs` (250 ms),
+which catches what no event announces, such as a script variable, and a page
+with scripts disabled, where the page cannot report. A redirect, reload or bot
+check that replaces the document costs one retry. One long `evaluate`, such as an in-page polling loop, fails with
 `Inspected target navigated or closed` when that happens, even after the load
 event. Match the block page as well as the content, so a challenge returns
 instead of timing out:
@@ -45,6 +48,9 @@ return await waitFor(() => {
   };
 }, { timeoutMs: 45000 });
 ```
+
+Headless Chrome has no PDF viewer: a navigation to a PDF downloads it rather
+than rendering it, so fetch a PDF's bytes instead of printing its page.
 
 When an event marks readiness exactly, register it before navigating:
 `Page.loadEventFired` (after `Page.enable`) for a document,

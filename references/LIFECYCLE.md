@@ -18,6 +18,15 @@ sign-in rejects the browser. The recorded child handle is the cleanup
 authority. No process-name searches, port eviction, shared lock directory, or
 repo launcher is needed.
 
+A launched Chrome, claimed or `--once`, saves downloads to its profile's
+`Downloads` folder: they go with a temporary profile and stay in a kept
+`--profile`. On macOS, Chrome otherwise writes into the user's `~/Downloads`,
+headless too. Before closing Chrome the probe cancels any download still
+running, which would hold `Browser.close` on Chrome's "Download is in
+progress" prompt for about 8 s. A probe that sends its own
+`Browser.setDownloadBehavior` replaces this: keep `downloadPath` inside the
+profile and `eventsEnabled: true`.
+
 A claimed browser continues across probes; see
 [Claimed browsers](#claimed-browsers). A `--once` probe is a cold rotation with
 a fresh profile that closes when it returns, so save screenshots or response

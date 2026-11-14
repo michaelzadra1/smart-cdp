@@ -420,6 +420,11 @@ every item of a run.
 - When a few items stay slow past the p95 latency, hedge them with a second
   attempt (an alternate request shape or a cache-busting parameter) and abort
   the sibling at the first definitive answer.
+- When an item's alternatives run at once and the first in priority order
+  wins, start them all, read them in order, then abort the rest and await
+  their teardown before reporting. Run one after another, a receipt's link
+  and body checks cost 5 to 10 s more per item. A process that reports and
+  exits while a `--once` Chrome is still launching leaves that Chrome running.
 
 ## Waits
 
@@ -450,6 +455,11 @@ every item of a run.
   share its cookie jar and often its renderer, so they are not independent
   sessions.
 - Stagger streams that share a machine when a challenge solve is CPU-bound.
+- Launch the isolated `--once` Chromes a run will need while its first step
+  runs, each still serving one job in its own profile, and close the unused
+  ones before reporting. A cold launch costs 0.5 to 2.5 s on the critical path.
+  Close only Chromes that finished starting: closing one mid-launch waits out
+  the launch.
 
 ### When slow requests fill the cap
 

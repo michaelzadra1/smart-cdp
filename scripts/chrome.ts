@@ -22,7 +22,30 @@ export type Chrome = {
   endpoint?: string;
   exited: Promise<unknown>;
   running: () => boolean;
+  /** Downloads still running, by guid, which stopChrome cancels before closing. */
+  downloads: Set<string>;
 };
+
+/**
+ * Browser.setDownloadBehavior for a launched Chrome: downloads go to its own
+ * profile's Downloads folder, deleted with a temporary profile, and report
+ * their progress, which trackDownload follows. Without it Chrome saves into
+ * the user's ~/Downloads, even headless.
+ */
+export const profileDownloads = (chrome: Chrome) => ({
+  behavior: "allow" as const,
+  downloadPath: join(chrome.profile, "Downloads"),
+  eventsEnabled: true,
+});
+
+/** Follows Browser.downloadWillBegin and Browser.downloadProgress events. */
+export function trackDownload(
+  chrome: Chrome,
+  { guid, state }: { guid: string; state?: string }
+) {
+  if (state === undefined || state === "inProgress") chrome.downloads.add(guid);
+  else chrome.downloads.delete(guid);
+}
 
 export async function chromeBinary(): Promise<string> {
   if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
@@ -249,6 +272,7 @@ export async function launchBrowser({
       });
     }),
     running: () => child.exitCode === null && child.signalCode === null,
+    downloads: new Set(),
   };
   if (child.pid) onSpawn?.(child.pid);
   log?.(`Owned ${name} pid=${child.pid} profile=${profile}`);
@@ -285,15 +309,25 @@ export async function launchBrowser({
  * Stops a launched Chrome or app and removes its generated profile, never a
  * kept one.
  * Browser.close is a graceful shutdown: it flushes cookies to disk, which a
- * signal can drop (a fresh sign-in vanishes on the next launch).
+ * signal can drop (a fresh sign-in vanishes on the next launch). A download
+ * still running holds Browser.close on Chrome's "Download is in progress"
+ * prompt until the signals below, about 8 seconds, so those are cancelled first.
  */
 export async function stopChrome(
   chrome: Chrome,
-  closeBrowser?: () => Promise<unknown>
+  browser?: {
+    cancelDownload: (guid: string) => Promise<unknown>;
+    close: () => Promise<unknown>;
+  }
 ): Promise<void> {
-  if (chrome.running() && closeBrowser) {
+  if (chrome.running() && browser) {
+    await Promise.all(
+      [...chrome.downloads].map((guid) =>
+        browser.cancelDownload(guid).catch(() => {})
+      )
+    );
     await Promise.race([
-      closeBrowser().catch(() => {}),
+      browser.close().catch(() => {}),
       delay(3000, undefined, { ref: false }),
     ]);
     await Promise.race([chrome.exited, delay(5000, undefined, { ref: false })]);

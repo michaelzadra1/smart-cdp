@@ -6,7 +6,9 @@ import {
   type Chrome,
   type ChromeProfile,
   launchChrome,
+  profileDownloads,
   stopChrome,
+  trackDownload,
 } from "./chrome";
 import { type ElectronApp, launchApp } from "./electron";
 
@@ -76,7 +78,7 @@ type Message = {
   id?: number;
   method?: string;
   sessionId?: string;
-  params?: { sessionId?: string };
+  params?: { sessionId?: string; guid?: string; state?: string };
   result?: { sessionId?: string; targetId?: string };
   error?: { message: string };
 };
@@ -125,7 +127,12 @@ const closeBrowser = () =>
 const shutdown = (error?: unknown) => {
   stopping ??= (async () => {
     clearTimeout(idle);
-    if (chrome) await stopChrome(chrome, closeBrowser);
+    if (chrome)
+      await stopChrome(chrome, {
+        cancelDownload: (guid) =>
+          call({ method: "Browser.cancelDownload", params: { guid } }),
+        close: closeBrowser,
+      });
     if (upstream && upstream.readyState !== WebSocket.CLOSED) {
       const closed = new Promise((resolve) =>
         upstream.addEventListener("close", resolve, { once: true })
@@ -223,6 +230,9 @@ upstream.addEventListener("message", (event) => {
     );
     return;
   }
+  const guid = message.params?.guid;
+  if (chrome && guid && message.method?.startsWith("Browser.download"))
+    trackDownload(chrome, { guid, state: message.params?.state });
   const owner = message.sessionId ? owners.get(message.sessionId) : undefined;
   if (!owner) return;
   const child = message.params?.sessionId;
@@ -259,6 +269,10 @@ upstream.addEventListener(
       let targetId: string | undefined;
       if (config.app) targetId = await appWindow();
       else if (chrome) {
+        await call({
+          method: "Browser.setDownloadBehavior",
+          params: profileDownloads(chrome),
+        });
         // The session's tab: every probe in the session continues on it.
         const { result, error } = await call({
           method: "Target.createTarget",

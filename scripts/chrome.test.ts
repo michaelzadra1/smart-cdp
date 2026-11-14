@@ -57,6 +57,7 @@ test("stopping a crashed browser stops the helpers it orphaned", async () => {
     kept: false,
     exited: new Promise((resolve) => child.once("exit", resolve)),
     running: () => child.exitCode === null && child.signalCode === null,
+    downloads: new Set(),
   };
   try {
     await delay(100);
