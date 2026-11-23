@@ -86,7 +86,8 @@ cdp.on(`Network.loadingFinished.${sessionId}`, onFinished);
 
 `responseReceived` does not prove the body is complete. Check
 `Network.loadingFailed` separately, including `blockedReason === "inspector"`
-for requests blocked by CDP. Redirects may reuse request IDs. Do not add broad
+for requests blocked by CDP. Count blocks by that field, not by `errorText`,
+which Android Chrome can leave empty. Redirects may reuse request IDs. Do not add broad
 request blocking/interception by default: it changes the page being measured.
 Bulk runs that only read an API are the exception; see
 [THROUGHPUT.md](THROUGHPUT.md#cut-bytes-and-cpu).
@@ -108,6 +109,13 @@ cover presses and typing. For a hover, drag or scroll, measure visible bounds
 and send `mouseMoved`, `mousePressed`, `mouseReleased` or `mouseWheel` through
 `send("Input.dispatchMouseEvent", ...)`, then inspect the actual resulting
 state.
+
+To review a layout at another size, set the viewport with
+`Emulation.setDeviceMetricsOverride` and the pointer with
+`Emulation.setTouchEmulationEnabled`, then screenshot with
+`captureBeyondViewport: false` so the image matches that viewport. Width and
+pointer are independent: a narrow desktop window still has a mouse, so check
+touch and hover affordances in all four width × pointer combinations.
 
 ## Targets and child sessions
 
@@ -187,6 +195,10 @@ await cdp.send("Target.setAutoAttach", {
 });
 if (opened) await cdp.send("Target.closeTarget", { targetId: opened.popupId });
 ```
+
+A popup left paused has not committed, so it lists with `url: ""` and hangs
+every command sent to it. Close it by target ID (`Target.closeTarget`, or
+`/json/close/<targetId>` on the debug port); the profile and its sign-in stay.
 
 If creating an additional task-owned target, use `background: true`, record its
 ID, and close only that target when finished. If `Target.createTarget` fails

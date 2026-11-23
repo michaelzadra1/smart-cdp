@@ -42,4 +42,5 @@ while being wrong. Refresh the capture when session state may have expired.
 | `Fetch.enable` handling `authRequired` but not every `requestPaused` | Continue, fulfill, or fail each paused request exactly once |
 | Believing a zero because the page's text lacks the value | Read a few pages by hand: it may sit in a link's parameter, a frame, behind a scroll or a short link |
 | Reporting a 403 as blocked, or a token match as a hit, from a fetch | Open the page in a browser and read it: a 403 hid a menu item that matched by accident, and the page had no such value |
+| Taking a responding debug port as proof the browser restarted | The old process may still be serving it: check that the browser PID changed |
 | Turning every polling loop into an event wait | Keep loops whose body does work (scrolling, dwell) or that watch state with no CDP event |
