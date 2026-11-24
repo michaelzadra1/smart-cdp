@@ -124,6 +124,8 @@ test("validates attachment boundaries and DevToolsActivePort", () => {
     ["--session", "x", "--port", "9222", "--target", "t"],
     ["--session", "x", "--idle-ms", "-1"],
     ["--once", "--session", "x"],
+    ["--release"],
+    ["--once", "--release"],
     ["--once", "--idle-ms", "5000"],
     ["--once", "--port", "9222", "--target", "t"],
     ["--end-session", "x", "--headless"],
@@ -386,18 +388,23 @@ test("waitFor survives a page that replaces itself after load", async () => {
     res.end(
       req.url === "/hop"
         ? '<title>Checking</title><script>onload = () => setTimeout(() => location.replace("/landed"), 300)</script>'
-        : "<title>Landed</title>"
+        : `<title>${req.url === "/stay" ? "Stay" : "Landed"}</title>`
     );
   });
   try {
-    const hop = `http://127.0.0.1:${portOf(server)}/hop`;
+    const base = `http://127.0.0.1:${portOf(server)}`;
+    const hop = `${base}/hop`;
     const { longWait, landed, timedOut } = await runProbe(
       parseOptions(["--once"]),
       async ({ send, evaluate, waitFor }) => {
-        await send("Page.navigate", { url: hop });
-        const longWait = await evaluate(
-          () => new Promise((resolve) => setTimeout(resolve, 3000))
-        ).catch(message);
+        // The evaluation starts the replacement itself: on a loaded machine
+        // /hop can replace itself before Page.navigate even returns.
+        await send("Page.navigate", { url: `${base}/stay` });
+        await waitFor(() => document.title === "Stay");
+        const longWait = await evaluate(() => {
+          setTimeout(() => location.replace("/landed"), 300);
+          return new Promise((resolve) => setTimeout(resolve, 3000));
+        }).catch(message);
         await send("Page.navigate", { url: hop });
         const landed = await waitFor(
           () => document.title === "Landed" && location.pathname
@@ -1023,6 +1030,35 @@ test("a session keeps Chrome and its tab across probes until ended", async () =>
   } finally {
     await cli("", ["--end-session", name]);
     await close(server);
+  }
+}, 60000);
+
+test("--release ends the session once its probe succeeds", async () => {
+  const name = `release-${process.pid}`;
+  try {
+    const failed = await cli('throw new Error("boom");', [
+      "--session",
+      name,
+      "--release",
+    ]);
+    expect(failed.status).toBe(1);
+    expect(failed.stderr).toContain(`Claimed browser ${name}`);
+    expect(failed.stderr).not.toContain("Released browser");
+    expect(await exists(sessionStatePath(name))).toBe(true);
+    const done = await cli("return await evaluate(() => 1 + 1);", [
+      "--session",
+      name,
+      "--release",
+    ]);
+    expect(done.status, done.stderr).toBe(0);
+    expect(done.stdout).toBe("2\n");
+    expect(done.stderr).toMatch(
+      new RegExp(`Released browser ${name}: closed Chrome pid=\\d+ and removed`)
+    );
+    expect(await exists(sessionStatePath(name))).toBe(false);
+  } finally {
+    if (await exists(sessionStatePath(name)))
+      await cli("", ["--end-session", name]);
   }
 }, 60000);
 

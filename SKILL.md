@@ -58,15 +58,16 @@ default-exported async function instead (type it with `ProbeContext` from
 | `waitFor(fn, { args, timeoutMs })` | Returns the page function's first truthy value, the moment the page shows it; survives redirects and reloads; throws after `timeoutMs` (30 s) |
 | `settle({ quietMs, timeoutMs })` | Waits until the document is parsed and the page has had no request in flight for `quietMs` (500 ms); `false` after `timeoutMs` (10 s), as on a page that streams or long-polls |
 | `click`, `type`, `press` | Trusted input; see [Acting on a page](#acting-on-a-page) |
-| `screenshot(path, { fullPage })` | Saves a `.png`, `.jpg` or `.webp` of the viewport, or the full page, creating the folder if needed, and returns the absolute path |
+| `screenshot(path, { fullPage })` | Renders a fresh frame of the page as it is and saves a `.png`, `.jpg` or `.webp` of the viewport, or the full page, creating the folder if needed; returns the absolute path |
 | `send(method, params)` | Any CDP command on the bound page |
 | `cdp`, `sessionId`, `targetId` | The browser-level client and the page's IDs, for events, targets and popups ([PROTOCOL.md](references/PROTOCOL.md)) |
 | `clickRecaptchaCheckbox`, `clickTurnstileCheckbox`, `holdPressAndHoldButton` | A visible challenge ([CAPTCHA.md](references/CAPTCHA.md)) |
 
 A claimed browser starts on a blank tab. Probe code itself runs in Bun, so
 `await import("node:fs/promises")` and `Buffer` work there; page functions
-see only the page. Define a page function once and pass it to several `evaluate` or `waitFor`
-calls; it sees no probe variables, so give it values as arguments. The result
+see only the page. A page function sees only its arguments, not probe variables or other
+functions. To share a reader between pages, wait for the state with
+`waitFor`, then run the one reader with `evaluate(reader)`. The result
 goes to stdout as JSON and diagnostics to stderr. The default
 deadline is 120 seconds (`--timeout-ms`). A lost browser connection ends the
 probe at once with exit 1, and stderr says why. An unhandled rejection in
@@ -143,8 +144,9 @@ that `--session` to every later probe in the task: each continues on the same
 tab with its page, cookies and page state, even after a probe throws or times
 out. A browser claimed with `--headless` needs `--headless` on every later
 probe too: without it the probe asks for a visible browser and is refused.
-When the task is done, release it with `--end-session b-7f3a1c`, unless the
-user wants the window kept open.
+Release it when the task is done, unless the user wants the window kept
+open: add `--release` to the last probe, which releases once that probe
+succeeds and keeps the browser if it fails, or run `--end-session b-7f3a1c`.
 
 Each probe still gets fresh CDP sessions, so domains, listeners and
 browser-level settings such as `Fetch.enable` reset between probes. Run one

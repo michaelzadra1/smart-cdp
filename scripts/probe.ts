@@ -141,6 +141,8 @@ const usage = `Usage: bun <skill>/scripts/probe.ts [options] < probe.js
   --session <id>         Continue in the browser claimed under this ID (or claim
                          one with a name you choose); its tab keeps its page
   --end-session <id>     Release that browser: close its Chrome and temp profile
+  --release              With --session: release the browser once this probe
+                         succeeds; a failed probe keeps it
   --idle-ms <ms>         Release a newly claimed browser after this long with no
                          probe (default 1800000; 0 keeps it until --end-session)
   --once                 Launch a cold browser for this probe only and close it
@@ -210,6 +212,7 @@ export function parseOptions(args: string[]) {
       session: { type: "string" },
       "idle-ms": { type: "string" },
       "end-session": { type: "string" },
+      release: { type: "boolean" },
       once: { type: "boolean" },
       personal: { type: "boolean" },
       "personal-profile": { type: "string" },
@@ -243,6 +246,10 @@ export function parseOptions(args: string[]) {
   ].filter((v) => v !== undefined);
   const keeps = values.session !== undefined || values["idle-ms"] !== undefined;
   if (values.session !== undefined) validSessionName(values.session);
+  if (values.release && values.session === undefined)
+    throw new Error(
+      "--release ends a --session browser; for one probe in its own browser use --once"
+    );
   if (keeps && values.once)
     throw new Error(
       "--once closes its browser, so it takes no --session or --idle-ms"
@@ -849,37 +856,34 @@ export async function runProbe<T = unknown>(
         ]));
       return typeof url === "string" ? url : "a closed page";
     };
-    // Polls from the host with short evaluations: a redirect or reload between
-    // polls costs one retry, where one long in-page wait fails outright.
-    // Resolves with the first value of `attempt` that `done` accepts; on
-    // timeout, `explain` words the last value or page error.
-    const poll = async (
-      name: string,
-      evaluateAttempt: () => Promise<unknown>,
-      options: PollOptions<unknown[]>,
+    // Tries from the host with short evaluations until `done` accepts a
+    // value: a redirect or reload between tries costs one retry, where one
+    // long in-page wait fails outright. Resolves with that value as `found`,
+    // or at the deadline with the last value or page error.
+    const until = async (
+      attempt: () => Promise<unknown>,
+      timeoutMs: number,
+      intervalMs: number,
       done: (value: unknown) => boolean,
-      explain: (last: unknown, lastError?: string) => string,
-      /** Ends the poll quietly, with undefined: something else answered. */
+      /** Ends it quietly, with undefined: something else answered. */
       stopped?: AbortSignal
     ) => {
-      knownOptions(name, options, POLL_OPTIONS);
-      const { timeoutMs = 30000, intervalMs = 250 } = options;
       const deadline = Date.now() + timeoutMs;
       const late = Symbol("late");
       let last: unknown;
       let lastError: Error | undefined;
       for (;;) {
         if (stopped?.aborted) return undefined;
-        const attempt = evaluateAttempt();
-        attempt.catch(() => {});
+        const trying = attempt();
+        trying.catch(() => {});
         try {
           const remaining = Math.max(deadline - Date.now(), 0);
           const value = await Promise.race([
-            attempt,
+            trying,
             delay(remaining, late, { ref: false }),
           ]);
           if (value === late) break;
-          if (done(value)) return value;
+          if (done(value)) return { found: value };
           last = value;
           lastError = undefined;
         } catch (error) {
@@ -897,9 +901,25 @@ export async function runProbe<T = unknown>(
         if (Date.now() >= deadline) break;
         await delay(intervalMs);
       }
+      return { last, lastError };
+    };
+    // `until`, for waitFor and click: throws at the deadline, and `explain`
+    // words the last value or page error.
+    const poll = async (
+      name: string,
+      attempt: () => Promise<unknown>,
+      options: PollOptions<unknown[]>,
+      done: (value: unknown) => boolean,
+      explain: (last: unknown, lastError?: string) => string,
+      stopped?: AbortSignal
+    ) => {
+      knownOptions(name, options, POLL_OPTIONS);
+      const { timeoutMs = 30000, intervalMs = 250 } = options;
+      const result = await until(attempt, timeoutMs, intervalMs, done, stopped);
+      if (!result || "found" in result) return result?.found;
       throw new Error(
         `${name} timed out after ${timeoutMs}ms on ${await pageUrl()}` +
-          explain(last, lastError?.message.split("\n")[0])
+          explain(result.last, result.lastError?.message.split("\n")[0])
       );
     };
     // Settles with fn's first truthy value from the page, which re-checks it on
@@ -991,33 +1011,17 @@ export async function runProbe<T = unknown>(
       knownOptions("settle", options, SETTLE_OPTIONS);
       const { quietMs = 500, timeoutMs = 10000 } = options;
       const began = Date.now();
-      const deadline = began + timeoutMs;
-      // The deadline also ends a readiness check that a dialog holds.
-      const done = new AbortController();
-      const late = delay(timeoutMs, false, {
-        ref: false,
-        signal: done.signal,
-      }).catch(() => false);
-      try {
-        for (;;) {
-          // Parsed, not loaded: load waits on every frame, and a slow
-          // third-party frame can hold it back for good. A document being
-          // replaced is not ready.
-          const ready =
-            network.quietMs(began) >= quietMs &&
-            (await Promise.race([
-              evaluateValue(() => document.readyState !== "loading", []).catch(
-                () => false
-              ),
-              late,
-            ]));
-          if (ready) return true;
-          if (Date.now() >= deadline) return false;
-          await delay(50);
-        }
-      } finally {
-        done.abort();
-      }
+      // Parsed, not loaded: load waits on every frame, and a slow third-party
+      // frame can hold it back for good.
+      const result = await until(
+        async () =>
+          network.quietMs(began) >= quietMs &&
+          (await evaluateValue(() => document.readyState !== "loading", [])),
+        timeoutMs,
+        50,
+        Boolean
+      );
+      return Boolean(result && "found" in result);
     };
     const goto: Goto = async (url, options = {}) => {
       knownOptions("goto", options, SETTLE_OPTIONS);
@@ -1117,31 +1121,33 @@ export async function runProbe<T = unknown>(
   }
 }
 
+/** Ends a session and says what that closed. */
+async function release(name: string) {
+  const state = await endSession(name);
+  if (state?.personal)
+    console.error(
+      `Released browser ${state.session}: closed its tab in your Chrome`
+    );
+  else if (state?.app)
+    console.error(
+      `Released browser ${state.session}: quit the copy of ${state.app.name} pid=${state.chromePid} and removed ${state.profile}`
+    );
+  else if (state)
+    console.error(
+      `Released browser ${state.session}: closed Chrome pid=${state.chromePid}` +
+        (state.keptProfile
+          ? `; kept profile ${state.profile}`
+          : ` and removed ${state.profile}`)
+    );
+}
+
 async function main() {
   const options = parseOptions(process.argv.slice(2));
   if (options.help) {
     console.log(usage);
     return;
   }
-  if (options["end-session"]) {
-    const state = await endSession(options["end-session"]);
-    if (state?.personal)
-      console.error(
-        `Released browser ${state.session}: closed its tab in your Chrome`
-      );
-    else if (state?.app)
-      console.error(
-        `Released browser ${state.session}: quit the copy of ${state.app.name} pid=${state.chromePid} and removed ${state.profile}`
-      );
-    else if (state)
-      console.error(
-        `Released browser ${state.session}: closed Chrome pid=${state.chromePid}` +
-          (state.keptProfile
-            ? `; kept profile ${state.profile}`
-            : ` and removed ${state.profile}`)
-      );
-    return;
-  }
+  if (options["end-session"]) return release(options["end-session"]);
   let snippet: string | Probe;
   if (options.file) {
     const probe: unknown = (
@@ -1157,6 +1163,7 @@ async function main() {
   }
   const result = await runProbe(options, snippet);
   if (result !== undefined) console.log(JSON.stringify(result));
+  if (options.release && options.session) await release(options.session);
 }
 
 if (import.meta.main) {
