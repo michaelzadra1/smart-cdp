@@ -3,6 +3,9 @@
 - This repository is one agent skill: `SKILL.md` is what agents read, with
   details in `references/`, code in `scripts/` and the `--personal` extension
   in `extension/`. Keep the scripts free of runtime dependencies.
+- `README.md` says what the repository is and how to clone it, nothing more.
+  Anything an agent or user needs to use or set up the skill goes in
+  `SKILL.md` or `references/`.
 - Bun is the only runtime, package manager and test runner: write scripts and
   tests in TypeScript and test with `bun:test`.
 - Validate code changes with `bun run format && bun run typecheck`, then

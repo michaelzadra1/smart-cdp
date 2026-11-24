@@ -16,56 +16,97 @@ description: >-
   production runtime or infrastructure.
 metadata:
   author: Michael Zadra
-  version: "6.3.0"
+  version: "6.4.0"
 ---
 
 # Smart CDP
 
-Use the scripts inside **this skill folder**, regardless of the working repo.
-Requirements: macOS, Bun and Google Chrome (or Chromium) in `/Applications`.
-Set `CHROME_BIN` only if Chrome is elsewhere. No credentials or repository
-package scripts are needed.
+Invoke the probe by its path in **this skill folder**, whatever the working
+repo, without changing directory: the user's repo stays the working
+directory. `SMART_CDP_SKILL` below is the directory containing this SKILL.md,
+as the skill loader gave it.
+Requirements: macOS, Bun and Google Chrome (or Chromium) in `/Applications`;
+set `CHROME_BIN` only if Chrome is elsewhere. Nothing needs installing: the
+scripts have no runtime dependencies, and
+`bun install --cwd "$SMART_CDP_SKILL" --production --ignore-scripts` adds only
+the pinned protocol types that type-check a `--file` probe.
 The probe reaches Chrome through a loopback port, so in a sandbox that blocks
 network access (Codex's default), run it with network or escalated permission.
 
-## Setup and first probe
-
-Resolve `SMART_CDP_SKILL` to the directory containing this SKILL.md, using the
-path supplied by the skill loader. Keep the user's repo as the working directory.
-The scripts have no runtime dependencies; `bun install --production` adds
-only the pinned protocol types that type-check a `--file` probe:
+## A probe
 
 ```bash
-SMART_CDP_SKILL="$(cd "$SMART_CDP_SKILL" && pwd -P)"
-bun install --cwd "$SMART_CDP_SKILL" --production --ignore-scripts
-bun "$SMART_CDP_SKILL/scripts/probe.ts" --help
-bun "$SMART_CDP_SKILL/scripts/probe.ts" --once <<'JS'
-return await evaluate(() => ({ url: location.href, title: document.title }));
+bun "$SMART_CDP_SKILL/scripts/probe.ts" <<'JS'
+const page = await goto("https://example.com/search?q=shoes");
+const found = await waitFor(() => {
+  const text = document.body?.innerText ?? "";
+  return /results|access denied|verify you are human/i.test(text) &&
+    { title: document.title, text: text.slice(0, 4000) };
+});
+return { ...page, ...found };
 JS
 ```
 
-Chrome is isolated and visible, with an OS-assigned port and a temporary
-profile, and opens in the background. Launched profiles have the password manager
-off, so no "Save password?" bubble covers the page after a scripted sign-in. Keep the visible default for any
-public site: anti-bot systems block headless Chrome on most real sites, so a
-headless
-challenge, 403, or empty page says nothing about the site. Use `--headless` only
-for local fixtures or pages known to have no bot protection, never to avoid a
-window, and re-run visible before reporting any headless block. Record the mode
-when comparing scraper behavior.
-`--profile <dir>` keeps a signed-in profile across probes; see
-[LIFECYCLE.md](references/LIFECYCLE.md#signing-in).
+stdin is an async JavaScript function body; `--file /path/probe.ts` takes a
+default-exported async function instead (type it with `ProbeContext` from
+`scripts/probe.ts`, whose `send` is typed per CDP method). Both receive:
 
-Pass an async JavaScript function body on stdin, or `--file /path/probe.ts`
-with a default-exported async function receiving the same context (type it with
-`ProbeContext` from `scripts/probe.ts`, whose `send` is typed per CDP method). The context is
-`{ cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press, clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }`.
-Results go to stdout as JSON; diagnostics go to stderr. The default deadline is 120 seconds.
-An unhandled rejection in probe code is logged and the probe carries on. At
-shutdown, stderr lists any command Chrome never answered. A "Leave site?" dialog
-is accepted automatically so it cannot stall a navigation or a tab closing;
-other dialogs stay yours to answer ([PROTOCOL.md](references/PROTOCOL.md#dialogs)). A lost browser
-connection ends the probe at once with exit 1, and stderr says why.
+| Name | Does |
+| --- | --- |
+| `goto(url, { quietMs, timeoutMs })` | Navigates, then settles. Returns `{ url, status, settled }`: the final URL and the document's HTTP status. A failed navigation throws; a page still busy after `timeoutMs` (10 s) returns `settled: false` |
+| `evaluate(fn, ...args)` | Runs a self-contained page function with JSON arguments and returns its JSON value. A returned DOM element throws: return its text or attributes |
+| `waitFor(fn, { args, timeoutMs })` | Returns the page function's first truthy value, the moment the page shows it; survives redirects and reloads; throws after `timeoutMs` (30 s) |
+| `settle({ quietMs, timeoutMs })` | Waits until the document is parsed and the page has had no request in flight for `quietMs` (500 ms); `false` after `timeoutMs` (10 s), as on a page that streams or long-polls |
+| `click`, `type`, `press` | Trusted input; see [Acting on a page](#acting-on-a-page) |
+| `screenshot(path, { fullPage })` | Saves a `.png`, `.jpg` or `.webp` of the viewport, or the full page, creating the folder if needed, and returns the absolute path |
+| `send(method, params)` | Any CDP command on the bound page |
+| `cdp`, `sessionId`, `targetId` | The browser-level client and the page's IDs, for events, targets and popups ([PROTOCOL.md](references/PROTOCOL.md)) |
+| `clickRecaptchaCheckbox`, `clickTurnstileCheckbox`, `holdPressAndHoldButton` | A visible challenge ([CAPTCHA.md](references/CAPTCHA.md)) |
+
+A claimed browser starts on a blank tab. Probe code itself runs in Bun, so
+`await import("node:fs/promises")` and `Buffer` work there; page functions
+see only the page. Define a page function once and pass it to several `evaluate` or `waitFor`
+calls; it sees no probe variables, so give it values as arguments. The result
+goes to stdout as JSON and diagnostics to stderr. The default
+deadline is 120 seconds (`--timeout-ms`). A lost browser connection ends the
+probe at once with exit 1, and stderr says why. An unhandled rejection in
+probe code is logged and the probe carries on; at shutdown, stderr lists any
+command Chrome never answered. A "Leave site?" dialog is accepted
+automatically; other dialogs stay yours to answer
+([PROTOCOL.md](references/PROTOCOL.md#dialogs)).
+
+Chrome is isolated and visible, with an OS-assigned port and a temporary
+profile, and opens in the background. Launched profiles have the password
+manager off, so no "Save password?" bubble covers the page after a scripted
+sign-in. Keep the visible default for any public site: anti-bot systems block
+headless Chrome on most real sites, so a headless challenge, 403, or empty
+page says nothing about the site. Use `--headless` only for local fixtures or
+pages known to have no bot protection, never to avoid a window, and re-run
+visible before reporting any headless block. Record the mode when comparing
+scraper behavior. `--profile <dir>` keeps a signed-in profile across probes;
+see [LIFECYCLE.md](references/LIFECYCLE.md#signing-in).
+
+## Fast probes
+
+Each probe costs a model turn, so a task's time is its number of probes plus
+whatever they wait and print.
+
+- **Wait on state, not time.** `goto` already settles. After an action, use
+  `waitFor` for the state the next step needs: it answers the moment that
+  state appears. When you cannot name the state, use `settle()`. A fixed
+  sleep is either too short or wasted; keep one only in a loop whose body is
+  the work, such as a scroll dwell or request pacing. A long in-page
+  `evaluate` loop fails when the site redirects or reloads.
+- **Put a whole step in one probe**: navigate, act, wait and read. Start a
+  new probe where you have to see a result before choosing the next action.
+  On a page you do not know, that is the first probe: `goto` it and return a
+  `slice` of `document.body.innerText` and `innerHTML`, then write the
+  selectors, actions and waits from what it shows.
+- **Return what you will reason with**: the matched rows, named fields or a
+  `slice` of the text, not a page's whole text or HTML. Write a large capture
+  to a file and return its path and counts.
+- **Match the block page as well as the content** in a `waitFor`, as above,
+  so a challenge returns at once instead of timing out.
 
 ## Acting on a page
 
@@ -94,7 +135,6 @@ Sites read that as automation, and a signed-in app, such as payroll or banking,
 may sign the user out on the spot. When a sign-out, challenge or "unusual
 activity" notice follows an action, change how you act before retrying, because
 each repeat on the user's account risks a lock.
-
 ## Claim, use, release
 
 A probe without `--session` claims a new browser and leaves it open. stderr
@@ -103,7 +143,8 @@ that `--session` to every later probe in the task: each continues on the same
 tab with its page, cookies and page state, even after a probe throws or times
 out. A browser claimed with `--headless` needs `--headless` on every later
 probe too: without it the probe asks for a visible browser and is refused.
-When the task is done, release it with `--end-session b-7f3a1c`.
+When the task is done, release it with `--end-session b-7f3a1c`, unless the
+user wants the window kept open.
 
 Each probe still gets fresh CDP sessions, so domains, listeners and
 browser-level settings such as `Fetch.enable` reset between probes. Run one
@@ -111,7 +152,8 @@ probe at a time per browser: a second while one runs is refused. A browser with
 no probe for 30 minutes closes itself (`--idle-ms` when claiming, `0` keeps it
 until released). `--session <name>` with an unused name claims a browser under
 that name. `--once` launches a cold browser for one probe and closes it: use it
-to compare cold starts. See [LIFECYCLE.md](references/LIFECYCLE.md#claimed-browsers).
+for a single read, or to compare cold starts. See
+[LIFECYCLE.md](references/LIFECYCLE.md#claimed-browsers).
 
 ## Your own Chrome profile
 
@@ -123,113 +165,71 @@ through the extension in `extension/`, using `chrome.debugger`. That route has
 none of the "Allow remote debugging?" prompts Chrome 144+ shows for every
 connection to its debugging port. `--end-session` closes only that tab.
 
-When the user names a profile, claim with `--personal-profile "<what they
-said>"`. It matches Chrome's profile-menu label ("Alex (Work)", also written
-"Alex Work"), the profile's own name ("Work") or its directory ("Profile 2"),
-ignoring case and punctuation, so pass their words through. An unknown name
-fails and lists every profile with its label and directory: pick the one they
-meant, or ask when it is unclear. `--personal-profile` implies `--personal`,
-and later probes in the session need only `--personal`, even after the tab
-closed: a session name keeps its profile.
-
-Chrome brings the new tab to the front. For work that runs beside the page
-the user is on, add `--background` to the claiming probe: the extension then
-moves the tab, behind the tab they used last, into that tab's window, and
-Chrome closes the window it had opened for it. Presses and keys reach the
-background tab as trusted input, but Chrome holds each `mouseMoved` there
-until a press flushes it, or for about 5 seconds. `click` sends the move and
-the press together; do the same with your own `Input.*`.
-
-The extension is needed only for `--personal`. The first `--personal` claim
-in a profile fails after 20 seconds if it isn't loaded there, and the error
-says how to load it. Ask the user to do this once in each profile they want
-driven: open `chrome://extensions`, turn on Developer mode, click **Load
-unpacked** and pick `$SMART_CDP_SKILL/extension`. Chrome lets no program do
-this. In a `--personal` probe, `cdp` reaches only that tab: there is no
-`Browser` or `Target` domain, so popups and other tabs are out of reach. Its
-passkey requests fail at once, so the profile's own passkey sheet never covers
-the page. See [LIFECYCLE.md](references/LIFECYCLE.md#your-own-chrome-profile).
+Read [LIFECYCLE.md](references/LIFECYCLE.md#your-own-chrome-profile) before
+the first `--personal` probe: it covers naming a profile
+(`--personal-profile`), keeping the tab behind the user's (`--background`),
+loading the extension, which the user does once per profile, and what `cdp`
+cannot reach there.
 
 ## Desktop apps (Electron)
 
-Use this only when the user explicitly asks to read or control a desktop app
-such as Slack, Discord, VS Code, Notion or Figma; never as a route to a site
-that also has a web version. Claim with `--app "<the app's name>"` and pass
-the same `--app` on every later probe in that session:
-
-```bash
-bun "$SMART_CDP_SKILL/scripts/probe.ts" --app Slack <<'JS'
-return await evaluate(() => ({ url: location.href, title: document.title }));
-JS
-```
-
-The probe starts a hidden copy of the app, signed in on a copy of its
-profile, and binds its main window; the user's own app keeps running
-untouched. The copy opens on the view the app last saved. `--end-session`
-quits the copy and deletes its profile.
+Use this only when the user explicitly asks to read a desktop app such as
+Slack, Discord, VS Code, Notion or Figma; never as a route to a site that
+also has a web version. Claim with `--app "<the app's name>"` and pass the
+same `--app` on every later probe in that session. The probe starts a hidden
+copy of the app, signed in on a copy of its profile; the user's own app keeps
+running untouched, and `--end-session` quits the copy and deletes its profile.
 
 **Read-only for now.** The session refuses input (`click`, `type`, `press`),
-navigation, reloads, request interception, answering dialogs and opening or
-closing windows. Read with `evaluate`, `waitFor`, DOM and `Accessibility`
-queries, screenshots and network events. Probe code must not act through page
-JavaScript either: no posting, reacting, marking read, or changing settings
-or drafts, and no API call that writes. Report what the app shows, and ask the
-user before any change that reading alone cannot do. To read a view the copy is
-not showing, read the data the page already holds, such as its IndexedDB or
-local storage. See [DESKTOP-APPS.md](references/DESKTOP-APPS.md) for how a
-session works, its limits and a Slack recipe.
+navigation (`goto`), reloads, request interception, answering dialogs and
+opening or closing windows. Read with `evaluate`, `waitFor`, DOM and
+`Accessibility` queries, screenshots and network events. Probe code must not
+act through page JavaScript either: no posting, reacting, marking read, or
+changing settings or drafts, and no API call that writes. Report what the app
+shows, and ask the user before any change that reading alone cannot do. Read
+[DESKTOP-APPS.md](references/DESKTOP-APPS.md) before the first `--app` probe:
+it covers how a session works, reading a view the copy is not showing, the
+limits and a Slack recipe.
 
-## WebFetch fallback hook
-
-`scripts/webfetch-fallback.ts` tells any agent or subagent to open a page here
-when WebFetch cannot read it. A hook adds this as context and does not grant
-permission: without an `autoMode.allow` entry for this fallback, auto mode's
-classifier can deny the probe as bot-check circumvention, and then the agent
-stops and reports it. It needs both events in
-the Claude Code user settings, because a blocked domain arrives as
-`PostToolUseFailure` and an HTTP 403 as a successful `PostToolUse`:
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [{ "matcher": "WebFetch", "hooks": [{ "type": "command", "command": "bun \"$HOME/.claude/skills/smart-cdp/scripts/webfetch-fallback.ts\"" }] }],
-    "PostToolUseFailure": [{ "matcher": "WebFetch", "hooks": [{ "type": "command", "command": "bun \"$HOME/.claude/skills/smart-cdp/scripts/webfetch-fallback.ts\"" }] }]
-  }
-}
-```
-
-## Workflow
+## Diagnosing a scraper or a blocked page
 
 1. Read the current repo's URL definitions and extraction code. Identify the
    actual failing URL, expected data, and browser mode before probing.
-2. Subscribe to required events before navigation. Wait for the specific DOM
-   condition with `waitFor`, or for the completed response the scraper needs.
-   Navigation acceptance alone is not readiness, and a long in-page `evaluate`
-   loop fails when the site redirects or reloads.
+2. Subscribe to required events before navigation, and wait for the
+   completed response or DOM state the scraper needs. Navigation acceptance
+   alone is not readiness.
 3. Collect final URL, response status/type, and relevant rendered evidence.
    Compare request order, cookies, headers, body, and timing when paths differ.
    A challenge page, failed request, or unfinished image is not an empty result.
 4. Save requested artifacts outside the skill folder, using explicit paths in
    the working repo or a task-owned temporary directory. Report observed results
    separately from hypotheses.
-5. Release the claimed browser with `--end-session` when the task is done,
-   unless the user wants the window kept open.
 
-Read [PROTOCOL.md](references/PROTOCOL.md) for navigation, extraction, response
-bodies, screenshots, and child-target and popup recipes. Read
-[LIFECYCLE.md](references/LIFECYCLE.md) for authorized attachment, cleanup,
-or cold rotation. Read [STEALTH.md](references/STEALTH.md) for instrumentation
-and anti-bot evidence, [CAPTCHA.md](references/CAPTCHA.md) for a visible
-challenge (`clickRecaptchaCheckbox()` handles the reCAPTCHA checkbox,
-`clickTurnstileCheckbox()` the Cloudflare Turnstile widget, and
-`holdPressAndHoldButton()` the HUMAN/PerimeterX Press & Hold button), and
-[DIAGNOSIS.md](references/DIAGNOSIS.md) to classify a failure or compare a
-working path with a failing one. Read
-[THROUGHPUT.md](references/THROUGHPUT.md) before building or tuning anything
-that pulls many items through the browser (dozens to thousands of searches,
-API calls or records per run), or when such a run is slow or refused under
-load: it covers in-page API replay, capped fan-out, streaming results out,
-pacing to rate meters, request blocking and how to measure a speed change.
+## References
+
+Read the one the task needs:
+
+- [PROTOCOL.md](references/PROTOCOL.md): response bodies and network capture,
+  hover, drag and scroll input, viewport emulation, OOPIFs, workers, popups
+  and new tabs, dialogs.
+- [LIFECYCLE.md](references/LIFECYCLE.md): signing in on a kept profile, how
+  claimed browsers and `--personal` work, cold rotation, and attaching to an
+  authorized existing browser.
+- [CAPTCHA.md](references/CAPTCHA.md): a visible challenge.
+  `clickRecaptchaCheckbox()` handles the reCAPTCHA checkbox,
+  `clickTurnstileCheckbox()` the Cloudflare Turnstile widget, and
+  `holdPressAndHoldButton()` the HUMAN/PerimeterX Press & Hold button.
+- [STEALTH.md](references/STEALTH.md): instrumentation and anti-bot evidence.
+- [SETUP.md](references/SETUP.md): when the user asks to install the skill
+  for another host, check an install, or add the WebFetch fallback hook.
+- [DIAGNOSIS.md](references/DIAGNOSIS.md): classifying a failure, or
+  comparing a working path with a failing one.
+- [THROUGHPUT.md](references/THROUGHPUT.md): before building or tuning
+  anything that pulls many items through the browser (dozens to thousands of
+  searches, API calls or records per run), or when such a run is slow or
+  refused under load. It covers in-page API replay, capped fan-out, streaming
+  results out, pacing to rate meters, request blocking and how to measure a
+  speed change.
 
 ## Boundaries
 
@@ -257,17 +257,3 @@ pacing to rate meters, request blocking and how to measure a speed change.
   dependencies as arguments. `Runtime.enable` is opt-in for needed events,
   not a prerequisite for evaluation. Do not automatically replay a probe after
   a lost connection or target: its actions may have side effects.
-
-## Portability and verification
-
-This repository is the skill: clone it, or symlink a clone, into a skill
-discovery directory (`~/.claude/skills/smart-cdp` for Claude Code,
-`~/.agents/skills/smart-cdp` for Codex, which follows symlinks; see its
-[skill discovery documentation](https://learn.chatgpt.com/docs/build-skills))
-and run the setup above. Its dependencies are exact pins, and nothing in it
-reaches another repo.
-
-Run `bun test "$SMART_CDP_SKILL"` for the offline checks and real local
-Chrome smoke test. The test serves its own page and makes no external requests.
-Discovery must also be checked through the host's skill listing from the intended
-repo: a readable SKILL.md alone is not proof that `$smart-cdp` can be selected.

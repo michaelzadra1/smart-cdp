@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { inPageCall } from "./in-page";
 import type { Send } from "./probe";
 
 /** A point in viewport CSS pixels. */
@@ -7,9 +8,32 @@ export type Point = { x: number; y: number };
 const pause = (min: number, spread: number) =>
   delay(min + Math.random() * spread);
 
+/** A capture makes Chrome produce a frame, even for a hidden page. */
+export const forceFrame = (send: Send) =>
+  send("Page.captureScreenshot", {
+    format: "jpeg",
+    quality: 1,
+    clip: { x: 0, y: 0, width: 1, height: 1, scale: 1 },
+  });
+
+/** In page: whether the page was hidden before it ever painted. */
+export function unpaintedInPage() {
+  return (
+    document.visibilityState !== "visible" &&
+    !performance.getEntriesByType("paint").length
+  );
+}
+
 /** Moves to the point and presses the left button there, as a person does. */
 export async function pressAt(send: Send, { x, y }: Point) {
   const button = { x, y, button: "left", clickCount: 1 } as const;
+  // Chrome drops a press on a page that has never painted, and a page hidden
+  // before its first frame never paints by itself.
+  const unpainted = await send("Runtime.evaluate", {
+    expression: inPageCall(unpaintedInPage),
+    returnByValue: true,
+  }).catch(() => undefined);
+  if (unpainted?.result.value) await forceFrame(send);
   // A hidden tab draws no frames, so Chrome holds a mouseMoved there until a
   // press flushes it, or for about 5 seconds: send both before awaiting.
   await Promise.all([
@@ -61,17 +85,16 @@ export async function clickPointInPage(
   // Two animation frames with the box unmoved: the press cannot land on
   // something in motion, and the page is painting, which matters because
   // Chrome drops a press that comes before the first paint. A hidden tab
-  // paints nothing, yet takes input.
-  if (document.visibilityState === "visible") {
-    const painted = await new Promise<boolean>((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
-      setTimeout(() => resolve(false), 200);
-    });
-    if (!painted) return { miss: "is on a page that is not painting" };
-    const now = element.getBoundingClientRect();
-    if (JSON.stringify(now) !== JSON.stringify(rect))
-      return { miss: "is still moving" };
-  }
+  // paints nothing, yet takes input; pressAt forces its first frame.
+  if (document.visibilityState !== "visible") return { x, y };
+  const painted = await new Promise<boolean>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+    setTimeout(() => resolve(false), 200);
+  });
+  if (!painted) return { miss: "is on a page that is not painting" };
+  const now = element.getBoundingClientRect();
+  if (JSON.stringify(now) !== JSON.stringify(rect))
+    return { miss: "is still moving" };
   return { x, y };
 }
 

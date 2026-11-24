@@ -91,6 +91,36 @@ named session, with an explicit close and an idle timeout.
 
 ## Your own Chrome profile
 
+Add `--personal` to the claiming probe and every later probe in the session.
+When the user names a profile, claim with `--personal-profile "<what they
+said>"`. It matches Chrome's profile-menu label ("Alex (Work)", also written
+"Alex Work"), the profile's own name ("Work") or its directory ("Profile 2"),
+ignoring case and punctuation, so pass their words through. An unknown name
+fails and lists every profile with its label and directory: pick the one they
+meant, or ask when it is unclear. `--personal-profile` implies `--personal`,
+and later probes in the session need only `--personal`, even after the tab
+closed: a session name keeps its profile.
+
+Chrome brings the new tab to the front. For work that runs beside the page
+the user is on, add `--background` to the claiming probe: the extension then
+moves the tab, behind the tab they used last, into that tab's window, and
+Chrome closes the window it had opened for it. Presses and keys reach the
+background tab as trusted input, but Chrome holds each `mouseMoved` there
+until a press flushes it, or for about 5 seconds. `click` sends the move and
+the press together; do the same with your own `Input.*`.
+
+The extension is needed only for `--personal`. The first `--personal` claim
+in a profile fails after 20 seconds if it isn't loaded there, and the error
+says how to load it. Ask the user to do this once in each profile they want
+driven: open `chrome://extensions`, turn on Developer mode, click **Load
+unpacked** and pick `$SMART_CDP_SKILL/extension`. Chrome lets no program do
+this. In a `--personal` probe, `cdp` reaches only that tab: there is no
+`Browser` or `Target` domain, so popups and other tabs are out of reach. Its
+passkey requests fail at once, so the profile's own passkey sheet never covers
+the page.
+
+### How it works
+
 `--personal` claims a session, as above, whose host is `scripts/personal.ts`
 instead of `relay.ts`. The host serves a blank page at
 `http://127.0.0.1:<port>/smart-cdp/<uuid>` and opens it with

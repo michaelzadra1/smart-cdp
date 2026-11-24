@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -35,6 +35,7 @@ import {
   watchInPage,
 } from "./in-page";
 import { clickPointInPage, type Point, press, pressAt, type } from "./input";
+import { trackNetwork } from "./network";
 import { holdPressAndHoldButton, type PressAndHoldResult } from "./press-hold";
 import { clickRecaptchaCheckbox } from "./recaptcha";
 import type { RelayConfig, RelayState, RelayStatus } from "./relay";
@@ -67,6 +68,29 @@ export type Click = <A extends unknown[]>(
   options?: PollOptions<A>
 ) => Promise<void>;
 
+type SettleOptions = { quietMs?: number; timeoutMs?: number };
+
+/**
+ * Waits until the document is parsed and the page has had no request in
+ * flight for `quietMs`; false if that took longer than `timeoutMs`.
+ */
+export type Settle = (options?: SettleOptions) => Promise<boolean>;
+
+/**
+ * Navigates and settles. Throws when the navigation fails; a slow page
+ * resolves with `settled: false`. `status` is the document's HTTP status.
+ */
+export type Goto = (
+  url: string,
+  options?: SettleOptions
+) => Promise<{ url: string; status: number | undefined; settled: boolean }>;
+
+/** Saves a .png, .jpg or .webp of the viewport, or the full page; returns the path. */
+export type Screenshot = (
+  path: string,
+  options?: { fullPage?: boolean }
+) => Promise<string>;
+
 /** What a probe (stdin body or --file default export) receives. */
 export type ProbeContext = {
   cdp: CdpClient;
@@ -74,7 +98,10 @@ export type ProbeContext = {
   sessionId: string;
   targetId: string;
   evaluate: Evaluate;
+  goto: Goto;
+  settle: Settle;
   waitFor: WaitFor;
+  screenshot: Screenshot;
   click: Click;
   type: (text: string) => Promise<void>;
   press: (key: string) => Promise<void>;
@@ -88,6 +115,21 @@ export type Probe<T = unknown> = (context: ProbeContext) => Promise<T>;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
+const SETTLE_OPTIONS = ["quietMs", "timeoutMs"];
+const SCREENSHOT_FORMATS: Record<string, "png" | "jpeg" | "webp"> = {
+  ".png": "png",
+  ".jpg": "jpeg",
+  ".jpeg": "jpeg",
+  ".webp": "webp",
+};
+
+function knownOptions(name: string, options: object, known: string[]) {
+  const unknown = Object.keys(options).filter((key) => !known.includes(key));
+  if (unknown.length)
+    throw new Error(
+      `${name}: unknown option ${unknown.join(", ")}; it takes ${known.join(", ")}`
+    );
+}
 
 class ReturnedNodeError extends Error {
   override message =
@@ -134,11 +176,19 @@ open (idle exit after 5 minutes), so Chrome asks to allow debugging only once.
 CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
-Context: { cdp, send, sessionId, targetId, evaluate, waitFor, click, type, press,
-  clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }
+Context: { cdp, send, sessionId, targetId, evaluate, goto, settle, waitFor,
+  screenshot, click, type, press, clickRecaptchaCheckbox, clickTurnstileCheckbox,
+  holdPressAndHoldButton }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
+goto(url, { quietMs, timeoutMs }) navigates, then settles; returns { url, status,
+settled } with the final URL and the document's HTTP status. A failed navigation
+throws; a page still busy after timeoutMs returns settled: false.
+settle({ quietMs = 500, timeoutMs = 10000 }) waits, instead of a sleep, until the
+document is parsed and no request has been in flight for quietMs; false on timeout.
+screenshot(path, { fullPage }) saves a .png, .jpg or .webp, creating its folder,
+and returns its path.
 waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) returns fn's first truthy
 value: the page re-checks fn on every DOM change and page event, and the host
 polls it every intervalMs, surviving redirects and reloads; throws on timeout.
@@ -750,8 +800,11 @@ export async function runProbe<T = unknown>(
             );
         }
       );
-      await send("Page.enable");
     }
+    const [network] = await Promise.all([
+      trackNetwork(client, send, sessionId),
+      !personal && send("Page.enable"),
+    ]);
     const evaluateOnce = async (expression: string) => {
       const result = await send("Runtime.evaluate", {
         expression,
@@ -809,13 +862,7 @@ export async function runProbe<T = unknown>(
       /** Ends the poll quietly, with undefined: something else answered. */
       stopped?: AbortSignal
     ) => {
-      const unknown = Object.keys(options).filter(
-        (key) => !POLL_OPTIONS.includes(key)
-      );
-      if (unknown.length)
-        throw new Error(
-          `${name}: unknown option ${unknown.join(", ")}; it takes ${POLL_OPTIONS.join(", ")}`
-        );
+      knownOptions(name, options, POLL_OPTIONS);
       const { timeoutMs = 30000, intervalMs = 250 } = options;
       const deadline = Date.now() + timeoutMs;
       const late = Symbol("late");
@@ -940,6 +987,72 @@ export async function runProbe<T = unknown>(
         ]);
       }
     };
+    const settle: Settle = async (options = {}) => {
+      knownOptions("settle", options, SETTLE_OPTIONS);
+      const { quietMs = 500, timeoutMs = 10000 } = options;
+      const began = Date.now();
+      const deadline = began + timeoutMs;
+      // The deadline also ends a readiness check that a dialog holds.
+      const done = new AbortController();
+      const late = delay(timeoutMs, false, {
+        ref: false,
+        signal: done.signal,
+      }).catch(() => false);
+      try {
+        for (;;) {
+          // Parsed, not loaded: load waits on every frame, and a slow
+          // third-party frame can hold it back for good. A document being
+          // replaced is not ready.
+          const ready =
+            network.quietMs(began) >= quietMs &&
+            (await Promise.race([
+              evaluateValue(() => document.readyState !== "loading", []).catch(
+                () => false
+              ),
+              late,
+            ]));
+          if (ready) return true;
+          if (Date.now() >= deadline) return false;
+          await delay(50);
+        }
+      } finally {
+        done.abort();
+      }
+    };
+    const goto: Goto = async (url, options = {}) => {
+      knownOptions("goto", options, SETTLE_OPTIONS);
+      const navigation = await send("Page.navigate", { url });
+      if (navigation.errorText)
+        throw new Error(`goto ${url}: ${navigation.errorText}`);
+      const settled = await settle(options);
+      return {
+        url: await evaluateValue(() => location.href, []).catch(pageUrl),
+        status: network.status(navigation.loaderId),
+        settled,
+      };
+    };
+    const screenshot: Screenshot = async (path, options = {}) => {
+      knownOptions("screenshot", options, ["fullPage"]);
+      const format = SCREENSHOT_FORMATS[extname(path).toLowerCase()];
+      if (!format)
+        throw new Error(
+          `screenshot: ${path} must end in ${Object.keys(SCREENSHOT_FORMATS).join(", ")}`
+        );
+      const clip = options.fullPage
+        ? { ...(await send("Page.getLayoutMetrics")).cssContentSize, scale: 1 }
+        : undefined;
+      const file = resolve(path);
+      const [{ data }] = await Promise.all([
+        send("Page.captureScreenshot", {
+          format,
+          captureBeyondViewport: Boolean(clip),
+          clip,
+        }),
+        mkdir(dirname(file), { recursive: true }),
+      ]);
+      await writeFile(file, Buffer.from(data, "base64"));
+      return file;
+    };
     const click: Click = async (target, options = {}) => {
       const [find, args, label] =
         typeof target === "string"
@@ -972,7 +1085,10 @@ export async function runProbe<T = unknown>(
       sessionId,
       targetId,
       evaluate,
+      goto,
+      settle,
       waitFor,
+      screenshot,
       click,
       type: (text) => type(send, text),
       press: (key) => press(send, key),

@@ -19,7 +19,16 @@ with `CdpConnectionClosedError`.
 
 ## Navigate and extract
 
-Wait for the page state the next step needs. `waitFor(fn, { args, timeoutMs,
+`goto(url)` sends `Page.navigate`, throws on its `errorText`, then waits as
+`settle()` does: until the document is parsed and the page's own session has
+had no request in flight for `quietMs`. That count starts when the call does,
+so each takes at least `quietMs`; frames in another process and WebSockets are
+not counted, and a request that never ends runs out `timeoutMs`. Every probe
+starts with `Network` enabled for this; a probe that sends `Network.disable`
+leaves `settle` blind.
+
+Settling says the page went quiet, not that it shows what you need: wait for
+the page state the next step needs. `waitFor(fn, { args, timeoutMs,
 intervalMs })` returns a page predicate's first truthy value, waiting up to 30 s
 by default. The page re-checks it on every DOM change and on hashchange,
 popstate, readystatechange, load and error events, so a state the DOM shows
@@ -32,13 +41,11 @@ event. Match the block page as well as the content, so a challenge returns
 instead of timing out:
 
 ```js
-const navigation = await send("Page.navigate", { url: "https://example.com/search" });
-if (navigation.errorText) throw new Error(navigation.errorText);
-return await waitFor(() => {
+const page = await goto("https://example.com/search");
+const found = await waitFor(() => {
   const text = document.body?.innerText ?? "";
   if (!/results|access denied|verify you are human/i.test(text)) return null;
   return {
-    url: location.href,
     title: document.title,
     text: text.slice(0, 4000),
     images: [...document.images].map((img) => ({
@@ -47,6 +54,7 @@ return await waitFor(() => {
     })),
   };
 }, { timeoutMs: 45000 });
+return { ...page, ...found };
 ```
 
 Headless Chrome has no PDF viewer: a navigation to a PDF downloads it rather
@@ -95,15 +103,12 @@ Bulk runs that only read an API are the exception; see
 ## Screenshots and input
 
 ```js
-const { writeFile } = await import("node:fs/promises");
-const { data } = await send("Page.captureScreenshot", {
-  format: "png",
-  captureBeyondViewport: false,
-});
-await writeFile("/absolute/task/path/page.png", Buffer.from(data, "base64"));
+return await screenshot("/absolute/task/path/page.png"); // or { fullPage: true }
 ```
 
-Inspect the screenshot before acting on visual controls. Input coordinates are
+The extension picks the format. For a clip or a quality setting, send
+`Page.captureScreenshot` yourself. Inspect the screenshot before acting on
+visual controls. Input coordinates are
 viewport CSS pixels, not necessarily image pixels. `click`, `type` and `press`
 cover presses and typing. For a hover, drag or scroll, measure visible bounds
 and send `mouseMoved`, `mousePressed`, `mouseReleased` or `mouseWheel` through
@@ -112,8 +117,8 @@ state.
 
 To review a layout at another size, set the viewport with
 `Emulation.setDeviceMetricsOverride` and the pointer with
-`Emulation.setTouchEmulationEnabled`, then screenshot with
-`captureBeyondViewport: false` so the image matches that viewport. Width and
+`Emulation.setTouchEmulationEnabled`, then take a viewport `screenshot`, not
+a full-page one, so the image matches that viewport. Width and
 pointer are independent: a narrow desktop window still has a mouse, so check
 touch and hover affordances in all four width × pointer combinations.
 

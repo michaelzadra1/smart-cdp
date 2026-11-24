@@ -101,9 +101,9 @@ test("the suggested command runs a probe with a hostile URL intact", async () =>
       ...args: string[]
     ) => (...values: unknown[]) => Promise<unknown>;
     const navigated: unknown[] = [];
-    await new AsyncFunction("send", "waitFor", body)(
-      (_method: string, params: { url: string }) => {
-        navigated.push(params.url);
+    await new AsyncFunction("goto", "evaluate", body)(
+      (target: string) => {
+        navigated.push(target);
         return {};
       },
       () => undefined

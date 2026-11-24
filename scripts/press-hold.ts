@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type ProtocolApi from "devtools-protocol/types/protocol";
+import { forceFrame } from "./input";
 import type { Send } from "./probe";
 
 type DomNode = ProtocolApi.DOM.Node;
@@ -173,10 +174,9 @@ export async function holdPressAndHoldButton({
   const y = (y1 + y3) / 2 + jitter();
   const button = { x, y, button: "left", clickCount: 1 } as const;
   // A cold background window drops a press that lands before its first
-  // paint (moves queue and flush, the press goes nowhere). Capturing a shot
-  // forces the compositor to produce a frame, and the settle lets Chrome
-  // start routing input into the frame.
-  await send("Page.captureScreenshot", { format: "jpeg", quality: 30 });
+  // paint (moves queue and flush, the press goes nowhere). The settle after
+  // the forced frame lets Chrome start routing input into it.
+  await forceFrame(send);
   await pause(350, 150);
   await send("Input.dispatchMouseEvent", {
     type: "mouseMoved",

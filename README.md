@@ -1,68 +1,18 @@
 # smart-cdp
 
-An agent skill for Claude Code and Codex that inspects websites through the
-Chrome DevTools Protocol, with no Puppeteer or Playwright. Agents use it to
-read pages, take screenshots, capture network and API traffic, diagnose
-scrapers and build fast browser-backed bulk scrapers. Each agent claims its own
-isolated Chrome and releases it when done; on request it can instead drive a
-tab in your own signed-in Chrome profile.
+An agent skill for Claude Code and Codex that drives Chrome through the Chrome
+DevTools Protocol, with no Puppeteer or Playwright. Agents use it to read
+pages, take screenshots, capture network traffic, diagnose scrapers and build
+fast browser-backed bulk scrapers, each in its own isolated Chrome.
 
-## Requirements
-
-- macOS
-- [Bun](https://bun.sh)
-- Google Chrome (or Chromium) in `/Applications`
-
-## Install
-
-Clone it into your agent's skills directory:
+Requires macOS, [Bun](https://bun.sh) and Google Chrome. Install by cloning
+into your agent's skills directory:
 
 ```sh
-# Claude Code
 git clone https://github.com/michaelzadra1/smart-cdp ~/.claude/skills/smart-cdp
-# Codex
-git clone https://github.com/michaelzadra1/smart-cdp ~/.agents/skills/smart-cdp
 ```
 
-To use both, clone once and symlink the clone into the other directory. Update
-with `git pull`. The agent installs the one pinned dependency on first use.
-
-Then ask for something browser-shaped, for example "open example.com with
-smart-cdp and tell me what the page loads".
-
-### Using your own Chrome profile (optional)
-
-By default every agent gets a fresh, isolated Chrome and needs no setup. To let
-an agent work in your own signed-in Chrome when you ask it to ("use my
-browser", "use my Work profile"), load the bundled extension once in each
-profile you want driven:
-
-1. Open `chrome://extensions` in that profile and turn on **Developer mode**.
-2. Click **Load unpacked** and pick the `extension` folder of your clone.
-
-Name the profile in your prompt the way Chrome's profile menu shows it, such
-as "Alex (Work)" or just "Work". The extension uses `chrome.debugger` on the
-one tab it opens, so Chrome shows no "Allow remote debugging?" prompt.
-
-### Reading a desktop app (Slack and other Electron apps)
-
-Ask explicitly, for example "read my Slack and list my channels". The agent
-copies the app's profile and opens a hidden copy of the app beside yours,
-which keeps running untouched. That session is read-only: it can read and take
-screenshots, but it cannot click, type or navigate. Releasing it quits the copy
-and deletes its profile. Needs no setup. See
-[DESKTOP-APPS.md](references/DESKTOP-APPS.md).
-
-### WebFetch fallback hook (optional, Claude Code)
-
-[SKILL.md](SKILL.md#webfetch-fallback-hook) has a hook that sends the agent
-here when WebFetch is blocked or gets a 403.
-
-## Development
-
-```sh
-bun install
-bun run format && bun run typecheck && bun run test
-```
-
-The tests run offline against a local Chrome. See [AGENTS.md](AGENTS.md).
+Then ask for something browser-shaped, such as "open example.com with
+smart-cdp and tell me what the page loads". [SKILL.md](SKILL.md) is what the
+agent reads; ask the agent to set up anything optional. Contributors: see
+[AGENTS.md](AGENTS.md).

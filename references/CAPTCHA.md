@@ -119,12 +119,13 @@ and work through [STEALTH.md](STEALTH.md).
 
 ## Other layouts
 
-Capture `Page.captureScreenshot({ format: "png", captureBeyondViewport: false })`
+Take a viewport `screenshot(path)`
 and locate the actual visible control; never click an iframe's center blindly or
 inject tokens. Input uses viewport CSS pixels, so scale screenshot measurements
 by the viewport size. A press that lands before a cold background window's first
-paint is dropped while its moves queue and flush; capture a screenshot first
-to force the frame. `DOM.getDocument({ depth: -1, pierce: true })` inspects
+paint is dropped while its moves queue and flush. `click` forces that frame on
+a hidden page that has never painted; before your own `Input.*`, capture a
+screenshot first to force it. `DOM.getDocument({ depth: -1, pierce: true })` inspects
 shadow roots and same-process frames; an out-of-process frame needs its own
 session ([PROTOCOL.md](PROTOCOL.md#targets-and-child-sessions)). Reinspect after
 each action. An image or audio challenge opened by a checkbox is unsolved until

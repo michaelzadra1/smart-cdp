@@ -423,6 +423,87 @@ test("waitFor survives a page that replaces itself after load", async () => {
   }
 }, 30000);
 
+test("goto and settle wait for a quiet network; screenshot saves the page", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "smart-cdp-shot-test-"));
+  // Renders only after a slow request, as a single-page app does.
+  const server = await serve((req, res) => {
+    if (req.url === "/slow") return void setTimeout(() => res.end("data"), 400);
+    if (req.url === "/hang") return;
+    res.statusCode = req.url === "/missing" ? 404 : 200;
+    res.setHeader("Content-Type", "text/html");
+    res.end(
+      `<title>Loading</title><button>Load</button><div style="height:3000px"></div><script>
+        const load = (title) => fetch("/slow").then(() => { document.title = title; });
+        load("Ready");
+        document.querySelector("button").onclick = () => load("Clicked");
+      </script>`
+    );
+  });
+  const closed = await serve(() => {});
+  const refused = `http://127.0.0.1:${portOf(closed)}/`;
+  await close(closed);
+  try {
+    const base = `http://127.0.0.1:${portOf(server)}`;
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ goto, settle, screenshot, click, evaluate }) => {
+        const title = () => evaluate(() => document.title);
+        const page = await goto(`${base}/`);
+        const loaded = await title();
+        await click("button");
+        const clickSettled = await settle();
+        const clicked = await title();
+        const viewport = await screenshot(join(dir, "viewport.png"));
+        const fullPage = await screenshot(join(dir, "new/full.jpg"), {
+          fullPage: true,
+        });
+        const missing = await goto(`${base}/missing`);
+        void evaluate(() => void fetch("/hang"));
+        return {
+          page,
+          loaded,
+          clickSettled,
+          clicked,
+          viewport,
+          fullPage,
+          missing: missing.status,
+          hung: await settle({ timeoutMs: 700 }),
+          failed: await goto(refused).catch(message),
+          format: await screenshot(join(dir, "page.gif")).catch(message),
+          option: await settle({ timeout: 1 } as never).catch(message),
+        };
+      }
+    );
+    expect(result).toMatchObject({
+      page: { url: `${base}/`, status: 200, settled: true },
+      loaded: "Ready",
+      clickSettled: true,
+      clicked: "Clicked",
+      viewport: join(dir, "viewport.png"),
+      fullPage: join(dir, "new/full.jpg"),
+      missing: 404,
+      hung: false,
+      option: "settle: unknown option timeout; it takes quietMs, timeoutMs",
+    });
+    expect(result.failed).toMatch(
+      /^goto http:.*: net::ERR_CONNECTION_REFUSED$/
+    );
+    expect(result.format).toMatch(/page\.gif must end in \.png, \.jpg/);
+    const [viewport, fullPage] = await Promise.all([
+      readFile(result.viewport),
+      readFile(result.fullPage),
+    ]);
+    expect(viewport.subarray(1, 4).toString()).toBe("PNG");
+    // A JPEG holds its height at bytes after the SOF0 marker; the full page
+    // is taller than any viewport.
+    const sof = fullPage.indexOf(Buffer.from([0xff, 0xc0]));
+    expect(fullPage.readUInt16BE(sof + 5)).toBeGreaterThanOrEqual(3000);
+  } finally {
+    await close(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 30000);
+
 test("waitFor answers a DOM change as it happens and polls what no event announces", async () => {
   const server = await serve((_req, res) => {
     res.setHeader("Content-Type", "text/html");
@@ -442,9 +523,15 @@ test("waitFor answers a DOM change as it happens and polls what no event announc
           url: `http://127.0.0.1:${portOf(server)}`,
         });
         await page;
-        const globals = await evaluate(
-          () => Object.getOwnPropertyNames(window).length
-        );
+        // The page's own `ready` may be set before or after the first count.
+        const countGlobals = () =>
+          evaluate(
+            () =>
+              Object.getOwnPropertyNames(window).filter(
+                (name) => name !== "ready"
+              ).length
+          );
+        const globals = await countGlobals();
         // A 5-second poll: only the page's own report can answer within it.
         await waitFor(() => Boolean(document.getElementById("late")), {
           intervalMs: 5000,
@@ -456,9 +543,7 @@ test("waitFor answers a DOM change as it happens and polls what no event announc
         const ready = await waitFor(() => Reflect.get(window, "ready"), {
           intervalMs: 100,
         });
-        const after = await evaluate(
-          () => Object.getOwnPropertyNames(window).length
-        );
+        const after = await countGlobals();
         // With scripts off the page reports nothing, and the poll still answers.
         await send("Emulation.setScriptExecutionDisabled", { value: true });
         const off = await waitFor(() => document.title, { timeoutMs: 2000 });
@@ -468,7 +553,7 @@ test("waitFor answers a DOM change as it happens and polls what no event announc
             timeoutMs: 300,
           }
         ).catch(message);
-        return { lag, ready, newGlobals: after - globals - 1, off, offTimeout };
+        return { lag, ready, newGlobals: after - globals, off, offTimeout };
       }
     );
     // Well under the 5-second poll, with room for a loaded CPU.
@@ -966,7 +1051,7 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
   });
   try {
     const url = `http://127.0.0.1:${portOf(server)}`;
-    const { clickMs, failures, title, value, events } = await runProbe(
+    const { clickMs, failures, paints, title, value, events } = await runProbe(
       parseOptions(["--once"]),
       async ({
         cdp,
@@ -978,9 +1063,9 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
         type,
         press,
       }) => {
-        await send("Page.navigate", { url });
-        await waitFor(() => document.readyState === "complete");
-        // Hide the tab without taking focus (SKILL.md, Boundaries).
+        // Hide the tab without taking focus (SKILL.md, Boundaries), and
+        // before the page loads: a page hidden before its first paint drops
+        // a press unless click forces a frame.
         const { windowId } = await cdp.Browser.getWindowForTarget({
           targetId,
         });
@@ -988,9 +1073,16 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
           windowId,
           bounds: { windowState: "minimized" },
         });
-        await waitFor(() => document.visibilityState === "hidden", {
-          intervalMs: 50,
-        });
+        await send("Page.navigate", { url });
+        await waitFor(
+          () =>
+            document.readyState === "complete" &&
+            document.visibilityState === "hidden",
+          { intervalMs: 50 }
+        );
+        const paints = await evaluate(
+          () => performance.getEntriesByType("paint").length
+        );
         // A hidden tab holds a mouseMoved for at least 5 seconds, so a click
         // that waited on one would take that long, however loaded the machine.
         const started = Date.now();
@@ -1022,9 +1114,10 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
           value: document.querySelector<HTMLInputElement>("#field")?.value,
           events: (window as unknown as { events: unknown[][] }).events,
         }));
-        return { clickMs, failures, ...page };
+        return { clickMs, failures, paints, ...page };
       }
     );
+    expect(paints).toBe(0);
     expect(clickMs).toBeLessThan(4000);
     expect(title).toBe("picked 2024");
     expect(value).toBe("Ab1 .");
