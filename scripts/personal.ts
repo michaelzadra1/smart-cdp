@@ -98,12 +98,17 @@ const forwardFromClient = (socket: Socket, raw: string) => {
 // The profile's own passkeys open Chrome's passkey sheet (Touch ID), which
 // nothing in the page can close. An empty virtual authenticator answers the
 // tab's passkey requests instead, so they fail at once, as on a device with no
-// passkey, and the site offers another way in. Reattaching drops it.
+// passkey, and the site offers another way in. Focus emulation keeps
+// document.visibilityState === "visible" and requestAnimationFrame running
+// even when --background tucks the tab behind another tab or the user switches
+// to a different Chrome profile window on macOS (without taking OS focus).
+// Reattaching drops all three.
 async function prepareTab() {
   // Lets the host answer "Leave site?": it blocks navigation and closing the tab.
   await Promise.all([
     call("Page.enable"),
     call("WebAuthn.enable", { enableUI: false }),
+    call("Emulation.setFocusEmulationEnabled", { enabled: true }),
   ]);
   await call("WebAuthn.addVirtualAuthenticator", {
     options: {

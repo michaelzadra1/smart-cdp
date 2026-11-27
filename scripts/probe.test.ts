@@ -1786,6 +1786,20 @@ test("snapshot and timeout previews strip script/style/noscript, scroll() works 
         // Background tab with scroll-behavior: smooth + noscript/style/script tags.
         const bg = await withTab(async (tab) => {
           await tab.goto(url, { wait: "dom" });
+          const raf = await tab.evaluate(
+            () =>
+              new Promise<{ fired: boolean; vis: string }>((resolve) => {
+                let done = false;
+                requestAnimationFrame(() => {
+                  done = true;
+                  resolve({ fired: true, vis: document.visibilityState });
+                });
+                setTimeout(() => {
+                  if (!done)
+                    resolve({ fired: false, vis: document.visibilityState });
+                }, 1000);
+              })
+          );
           const snap = await tab.snapshot();
           const s1 = await tab.scroll(1200);
           const sBottom = await tab.scroll("bottom");
@@ -1794,7 +1808,7 @@ test("snapshot and timeout previews strip script/style/noscript, scroll() works 
           const previewErr = await tab
             .waitFor(() => false, { timeoutMs: 200 })
             .catch(message);
-          return { snap, s1, sBottom, sTop, sBox, previewErr };
+          return { raf, snap, s1, sBottom, sTop, sBox, previewErr };
         });
 
         await goto(url, { wait: "dom" });
@@ -1821,6 +1835,7 @@ test("snapshot and timeout previews strip script/style/noscript, scroll() works 
       expect(result.bg.snap.text).not.toContain(leak);
       expect(result.bg.previewErr).not.toContain(leak);
     }
+    expect(result.bg.raf).toEqual({ fired: true, vis: "visible" });
     expect(result.bg.snap.text).toContain("Visible Heading");
     expect(result.bg.previewErr).toContain("Visible Heading");
     expect(result.bg.s1.y).toBeGreaterThanOrEqual(1000);

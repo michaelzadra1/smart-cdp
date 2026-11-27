@@ -972,7 +972,8 @@ export async function runProbe<T = unknown>(
     const bindPage = async (
       boundTargetId: string,
       boundSessionId: string,
-      isPersonal: boolean
+      isPersonal: boolean,
+      emulateFocus = false
     ): Promise<{ page: PageContext; dispose: () => void }> => {
       const send: Send = (method, params) =>
         client.send(method, params ?? {}, boundSessionId);
@@ -992,6 +993,13 @@ export async function runProbe<T = unknown>(
       const [network] = await Promise.all([
         trackNetwork(client, send, boundSessionId),
         !isPersonal && send("Page.enable"),
+        // Background tabs (withTab) have visibilityState === "hidden" and pause
+        // requestAnimationFrame, stalling React Suspense / Next.js streaming;
+        // focus emulation keeps rAF running without taking OS window focus.
+        emulateFocus &&
+          send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(
+            () => {}
+          ),
       ]);
       const evaluateOnce = async (expression: string) => {
         const result = await send("Runtime.evaluate", {
@@ -1734,7 +1742,12 @@ export async function runProbe<T = unknown>(
             flatten: true,
           });
         entry.sessionId = childSessionId;
-        const bound = await bindPage(childTargetId, childSessionId, false);
+        const bound = await bindPage(
+          childTargetId,
+          childSessionId,
+          false,
+          true
+        );
         entry.dispose = bound.dispose;
         return await fn(bound.page);
       } finally {
