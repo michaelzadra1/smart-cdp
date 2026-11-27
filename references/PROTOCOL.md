@@ -134,12 +134,15 @@ return await screenshot("/absolute/task/path/page.png"); // or { fullPage: true 
 
 The extension picks the format. For a clip or a quality setting, send
 `Page.captureScreenshot` yourself. Inspect the screenshot before acting on
-visual controls. Input coordinates are
-viewport CSS pixels, not necessarily image pixels. `click`, `type` and `press`
-cover presses and typing. For a hover, drag or scroll, measure visible bounds
-and send `mouseMoved`, `mousePressed`, `mouseReleased` or `mouseWheel` through
-`send("Input.dispatchMouseEvent", ...)`, then inspect the actual resulting
-state.
+visual controls. Input coordinates are viewport CSS pixels, not necessarily
+image pixels. `click`, `fill`, `type`, `press` and `scroll` cover presses,
+typing and scrolling. Use `scroll()` instead of `Input.dispatchMouseEvent`
+`mouseWheel` or `evaluate(() => window.scrollBy(...))` in background tabs
+(`withTab`, `--background`): Chrome hangs `mouseWheel` and unresolved
+`scroll-behavior: smooth` Promises in hidden tabs. For a hover or drag, measure
+visible bounds and send `mouseMoved`, `mousePressed` and `mouseReleased`
+through `send("Input.dispatchMouseEvent", ...)`, then inspect the actual
+resulting state.
 
 To review a layout at another size, set the viewport with
 `Emulation.setDeviceMetricsOverride` and the pointer with

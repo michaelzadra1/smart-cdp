@@ -1757,3 +1757,104 @@ test("withTab runs parallel background tabs, waitForResponse captures API JSON, 
     await close(server);
   }
 }, 30000);
+
+test("snapshot and timeout previews strip script/style/noscript, scroll() works on smooth-scroll background tabs, click skips hidden duplicates, and timeouts close leaked withTab tabs", async () => {
+  const server = await serve((_req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    res.end(`<!doctype html>
+      <style>html { scroll-behavior: smooth; } .hidden-cls { display: none; }</style>
+      <title>Clean Text</title>
+      <body>
+        <noscript><iframe title="gtag-noscript"></iframe>NO_SCRIPT_LEAK</noscript>
+        <style>#inline-css { color: red; }</style>
+        <script>window.__noise = "SCRIPT_LEAK";</script>
+        <p class="hidden-cls">DISPLAY_NONE_LEAK</p>
+        <p hidden>HIDDEN_ATTR_LEAK</p>
+        <h1>Visible Heading</h1>
+        <button id="hid" class="dup" hidden>Sizing chart</button>
+        <button id="vis" class="dup" onclick="document.title='Clicked Visible'">Sizing chart</button>
+        <div id="box" style="height:100px;overflow:auto"><div style="height:600px">Inner</div></div>
+        <div style="height:4000px">Tall content</div>
+      </body>`);
+  });
+  const sid = `leak-check-${process.pid}`;
+  try {
+    const url = `http://127.0.0.1:${portOf(server)}/`;
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ withTab, goto, click, evaluate }) => {
+        // Background tab with scroll-behavior: smooth + noscript/style/script tags.
+        const bg = await withTab(async (tab) => {
+          await tab.goto(url, { wait: "dom" });
+          const snap = await tab.snapshot();
+          const s1 = await tab.scroll(1200);
+          const sBottom = await tab.scroll("bottom");
+          const sTop = await tab.scroll("top");
+          const sBox = await tab.scroll({ selector: "#box", y: 200 });
+          const previewErr = await tab
+            .waitFor(() => false, { timeoutMs: 200 })
+            .catch(message);
+          return { snap, s1, sBottom, sTop, sBox, previewErr };
+        });
+
+        await goto(url, { wait: "dom" });
+        // CSS selector click skips the hidden first `.dup` and clicks the visible second one.
+        await click("button.dup");
+        const titleAfterDupClick = await evaluate(() => document.title);
+        // Custom finder returning a hidden element names it in the error.
+        const hiddenErr = await click(() => document.getElementById("hid"), {
+          timeoutMs: 250,
+        }).catch(message);
+
+        return { bg, titleAfterDupClick, hiddenErr };
+      }
+    );
+
+    for (const leak of [
+      "gtag-noscript",
+      "NO_SCRIPT_LEAK",
+      "#inline-css",
+      "SCRIPT_LEAK",
+      "DISPLAY_NONE_LEAK",
+      "HIDDEN_ATTR_LEAK",
+    ]) {
+      expect(result.bg.snap.text).not.toContain(leak);
+      expect(result.bg.previewErr).not.toContain(leak);
+    }
+    expect(result.bg.snap.text).toContain("Visible Heading");
+    expect(result.bg.previewErr).toContain("Visible Heading");
+    expect(result.bg.s1.y).toBeGreaterThanOrEqual(1000);
+    expect(result.bg.sBottom.atBottom).toBe(true);
+    expect(result.bg.sTop.y).toBe(0);
+    expect(result.bg.sBox.y).toBeGreaterThan(0);
+    expect(result.titleAfterDupClick).toBe("Clicked Visible");
+    expect(result.hiddenErr).toMatch(
+      /matched <button#hid\[hidden\]> with no size/
+    );
+
+    // A probe that times out while withTab tabs are open closes them in cleanup().
+    const timedOut = await cli(
+      `await Promise.all([1, 2].map(() => withTab(async (t) => {
+        await t.goto(${JSON.stringify(url)}, { wait: "dom" });
+        await new Promise(() => {});
+      })));`,
+      ["--session", sid, "--timeout-ms", "2000"]
+    );
+    expect(timedOut.status).toBe(1);
+    const remaining = await cli(
+      `return (await cdp.Target.getTargets()).targetInfos.filter(t => t.type === "page").length;`,
+      ["--session", sid, "--release"]
+    );
+    expect(remaining.status, remaining.stderr).toBe(0);
+    expect(JSON.parse(remaining.stdout)).toBe(1);
+
+    // Node-side DOM ReferenceError gets a clear evaluate() hint.
+    const refErr = await cli("return document.title;", ["--once"]);
+    expect(refErr.status).toBe(1);
+    expect(refErr.stderr).toMatch(/wrap DOM access in evaluate/);
+  } finally {
+    if (await exists(sessionStatePath(sid)))
+      await cli("", ["--end-session", sid]);
+    await close(server);
+  }
+}, 30000);

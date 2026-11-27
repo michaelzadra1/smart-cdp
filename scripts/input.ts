@@ -61,8 +61,16 @@ export async function clickPointInPage(
   const element = find(...args);
   if (!(element instanceof Element)) return { miss: "matched no element" };
   let rect = element.getBoundingClientRect();
-  if (!rect.width || !rect.height)
-    return { miss: "matched an element with no size" };
+  if (!rect.width || !rect.height) {
+    const tag = element.tagName.toLowerCase();
+    const attrs = [
+      element.id ? `#${element.id}` : "",
+      (element as HTMLElement).hidden ? "[hidden]" : "",
+    ].join("");
+    return {
+      miss: `matched <${tag}${attrs}> with no size (filter out hidden duplicates with r.width > 0)`,
+    };
+  }
   if (
     rect.right <= 0 ||
     rect.bottom <= 0 ||

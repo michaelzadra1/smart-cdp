@@ -15,7 +15,7 @@ description: >-
   repository's production runtime or infrastructure.
 metadata:
   author: Michael Zadra
-  version: "6.6.0"
+  version: "6.7.0"
 ---
 
 # Smart CDP
@@ -51,7 +51,8 @@ diagnostics go to stderr. Default deadline is 120 s (`--timeout-ms`).
 | Context helper | Behavior |
 | --- | --- |
 | `goto(url, { wait, quietMs, timeoutMs, maxInFlight })` | Navigates and waits: `"settle"` (default: parsed DOM + 300 ms quiet, 5 s cap, ignoring SSE/WebSocket/Media/beacons; pass `maxInFlight: 2` on polling/ad-heavy pages), `"dom"` (`DOMContentLoaded`, fast before `waitFor`), `"load"`, or `"none"`. Returns `{ url, status, settled }` |
-| `snapshot({ selector, maxText, maxElements })` | Returns `{ url, title, text, elements }` with collapsed visible text (3,000 chars) and visible interactive controls with verified CSS selectors ready for `click()` (60 max) |
+| `snapshot({ selector, maxText, maxElements })` | Returns `{ url, title, text, elements }` with clean visible text (3,000 chars; skips `<script>`/`<style>`/`<noscript>`/hidden nodes) and visible interactive controls with verified CSS selectors ready for `click()` (60 max) |
+| `scroll(y \| "bottom" \| "top" \| { x, y, to, selector })` | Scrolls immediately (`behavior: "instant"`) and returns `{ x, y, width, height, atBottom }`; safe in hidden/background tabs (`withTab`, `--background`) where `mouseWheel` and implicit-return `window.scrollBy()` hang |
 | `evaluate(fn, ...args)` | Runs a self-contained page function with JSON args and returns its JSON value (returning a DOM element throws) |
 | `waitFor(fn, { args, timeoutMs, intervalMs })` | Event-driven on DOM mutations and page events (plus host fallback); returns the first truthy value, survives redirects/reloads, throws after `timeoutMs` (15 s) with a page preview |
 | `waitForResponse(match, { timeoutMs, body })` | Event-driven capture of the next response whose URL matches a string, `RegExp` or predicate `(info) => boolean`; waits for `loadingFinished` and returns `{ url, status, headers, mimeType, body, json }` (15 s default). Start it before the action that triggers the request |
@@ -112,14 +113,17 @@ await fill("input[name=q]", "ada@example.com"); // clicks, clears (Meta+a + Back
 await press("Enter"); // named key, US char ("-"), or chord ("Meta+a", "Shift+Tab")
 ```
 
-`click` checks immediately, then waits event-driven up to `timeoutMs` (10 s)
-until the target is visible, steady and uncovered, scrolls it into view and
-presses its center. On timeout it reports missing (with visible controls),
-zero-size or the covering element. `fill(target, text, { fast, clear })` clicks,
-clears existing text unless `clear: false`, and types; use `{ fast: true }` on
-`fill` or `type` for long non-sensitive queries/filters and keep default
-keystrokes on sign-in or bot-sensitive forms. For hover, drag or scroll, send
-`Input.*` ([PROTOCOL.md](references/PROTOCOL.md#screenshots-and-input)).
+`click` checks immediately (picking the first visible match for a CSS selector),
+then waits event-driven up to `timeoutMs` (10 s) until the target is visible,
+steady and uncovered, scrolls it into view and presses its center. On timeout it
+reports missing (with visible controls), zero-size or the covering element.
+`fill(target, text, { fast, clear })` clicks, clears existing text unless
+`clear: false`, and types; use `{ fast: true }` on `fill` or `type` for long
+non-sensitive queries/filters and keep default keystrokes on sign-in or
+bot-sensitive forms. Use `scroll()` for scrolling (especially in `withTab` or
+`--background` tabs: Chrome hangs `mouseWheel` and smooth-scroll Promises in
+hidden tabs). For hover or drag, send `Input.*`
+([PROTOCOL.md](references/PROTOCOL.md#screenshots-and-input)).
 
 Do not trigger actions from page JavaScript (`el.click()`, `focus()`,
 `select()`, `dispatchEvent`, assigning `value`): those set `isTrusted: false`

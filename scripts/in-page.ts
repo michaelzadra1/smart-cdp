@@ -158,16 +158,102 @@ export function snapshotInPage(
   const root = rootSelector
     ? document.querySelector(rootSelector)
     : document.body;
-  const rawText = (
-    (root as HTMLElement | null)?.textContent ??
-    document.body?.textContent ??
-    ""
-  )
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  const textTruncated = rawText.length > maxText;
-  const text = textTruncated ? rawText.slice(0, maxText) : rawText;
+
+  const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG"]);
+  const blockTags = new Set([
+    "ADDRESS",
+    "ARTICLE",
+    "ASIDE",
+    "BLOCKQUOTE",
+    "BR",
+    "DD",
+    "DIV",
+    "DL",
+    "DT",
+    "FIELDSET",
+    "FIGCAPTION",
+    "FIGURE",
+    "FOOTER",
+    "FORM",
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H5",
+    "H6",
+    "HEADER",
+    "HR",
+    "LI",
+    "MAIN",
+    "NAV",
+    "OL",
+    "P",
+    "PRE",
+    "SECTION",
+    "TABLE",
+    "TBODY",
+    "TD",
+    "TFOOT",
+    "TH",
+    "THEAD",
+    "TR",
+    "UL",
+  ]);
+  const extractVisibleText = (start: Node | null, limit: number) => {
+    if (!start || limit <= 0) return { text: "", truncated: false };
+    const chunks: string[] = [];
+    let len = 0;
+    let truncated = false;
+    const walk = (node: Node) => {
+      if (truncated) return;
+      if (node.nodeType === 3) {
+        const piece = (node.nodeValue ?? "").replace(/[ \t\r\n]+/g, " ");
+        if (piece.trim()) {
+          if (chunks.length && chunks[chunks.length - 1] !== "\n") {
+            chunks.push(" ");
+            len += 1;
+          }
+          const trimmed = piece.trim();
+          chunks.push(trimmed);
+          len += trimmed.length;
+          if (len > limit) truncated = true;
+        }
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const el = node as HTMLElement;
+      if (skipTags.has(el.tagName) || el.hidden) return;
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return;
+      const block = blockTags.has(el.tagName);
+      if (block && chunks.length && chunks[chunks.length - 1] !== "\n") {
+        chunks.push("\n");
+        len += 1;
+      }
+      for (let child = el.firstChild; child; child = child.nextSibling) {
+        walk(child);
+        if (truncated) return;
+      }
+      if (block && chunks.length && chunks[chunks.length - 1] !== "\n") {
+        chunks.push("\n");
+        len += 1;
+      }
+    };
+    walk(start);
+    const joined = chunks
+      .join("")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    const isTrunc = truncated || joined.length > limit;
+    return {
+      text: isTrunc ? joined.slice(0, limit) : joined,
+      truncated: isTrunc,
+    };
+  };
+
+  const { text, truncated: textTruncated } = extractVisibleText(root, maxText);
 
   const isUnique = (selector: string, el: Element) => {
     try {
@@ -344,10 +430,7 @@ export function snapshotInPage(
     }
 
     const labelText = (
-      el.getAttribute("aria-label") ||
-      (el as HTMLElement).textContent ||
-      el.textContent ||
-      ""
+      el.getAttribute("aria-label") || extractVisibleText(el, 80).text
     )
       .replace(/\s+/g, " ")
       .trim()
@@ -372,13 +455,93 @@ export function snapshotInPage(
   return out;
 }
 
-/** In page: compact title + text preview for actionable timeout errors. */
+/** In page: compact title + visible text preview for actionable timeout errors. */
 export function pagePreviewInPage(): { title: string; text: string } {
+  const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG"]);
+  const parts: string[] = [];
+  let len = 0;
+  const walk = (node: Node) => {
+    if (len >= 220) return;
+    if (node.nodeType === 3) {
+      const s = (node.nodeValue ?? "").replace(/\s+/g, " ").trim();
+      if (s) {
+        parts.push(s);
+        len += s.length + 1;
+      }
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    const el = node as HTMLElement;
+    if (skipTags.has(el.tagName) || el.hidden) return;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return;
+    for (let child = el.firstChild; child; child = child.nextSibling) {
+      walk(child);
+      if (len >= 220) return;
+    }
+  };
+  if (document.body) walk(document.body);
   return {
     title: document.title,
-    text: (document.body?.textContent ?? "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 200),
+    text: parts.join(" ").trim().slice(0, 200),
+  };
+}
+
+/** Current scroll geometry reported by scroll(). */
+export type ScrollResult = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  atBottom: boolean;
+};
+
+/**
+ * In page: instant, non-blocking scroll safe in both visible and hidden
+ * background tabs. Avoids Chrome's smooth-scroll Promise (which hangs on
+ * hidden tabs with `scroll-behavior: smooth`).
+ */
+export function scrollInPage(
+  selector: string | null,
+  x: number | null,
+  y: number | null,
+  to: "top" | "bottom" | null
+): ScrollResult {
+  const el = selector ? document.querySelector(selector) : null;
+  if (selector && !el) {
+    throw new Error(`scroll: ${selector} matched no element`);
+  }
+  if (el) {
+    const targetTop =
+      to === "top"
+        ? 0
+        : to === "bottom"
+          ? el.scrollHeight
+          : el.scrollTop + (y ?? 0);
+    const targetLeft = to === "top" ? 0 : el.scrollLeft + (x ?? 0);
+    el.scrollTo({ left: targetLeft, top: targetTop, behavior: "instant" });
+    return {
+      x: Math.round(el.scrollLeft),
+      y: Math.round(el.scrollTop),
+      width: el.scrollWidth,
+      height: el.scrollHeight,
+      atBottom: el.scrollTop + el.clientHeight >= el.scrollHeight - 2,
+    };
+  }
+  const doc = document.scrollingElement ?? document.documentElement;
+  const targetTop =
+    to === "top"
+      ? 0
+      : to === "bottom"
+        ? doc.scrollHeight
+        : window.scrollY + (y ?? 0);
+  const targetLeft = to === "top" ? 0 : window.scrollX + (x ?? 0);
+  window.scrollTo({ left: targetLeft, top: targetTop, behavior: "instant" });
+  return {
+    x: Math.round(window.scrollX),
+    y: Math.round(window.scrollY),
+    width: doc.scrollWidth,
+    height: doc.scrollHeight,
+    atBottom: window.scrollY + window.innerHeight >= doc.scrollHeight - 2,
   };
 }

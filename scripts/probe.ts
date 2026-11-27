@@ -32,6 +32,8 @@ import {
   type PageSnapshot,
   pagePreviewInPage,
   returnByValueInPage,
+  type ScrollResult,
+  scrollInPage,
   snapshotInPage,
   stopWatchInPage,
   type WatchResult,
@@ -156,6 +158,22 @@ export type WaitForResponse = (
   options?: WaitForResponseOptions
 ) => Promise<CapturedResponse>;
 
+type ScrollOptions = {
+  x?: number;
+  y?: number;
+  to?: "top" | "bottom";
+  selector?: string;
+};
+
+/**
+ * Scrolls the page (or a container) immediately without hanging on hidden or
+ * smooth-scroll background tabs. Pass a vertical pixel delta (`scroll(1500)`),
+ * `"bottom"`/`"top"`, or `{ x, y, to, selector }`.
+ */
+export type Scroll = (
+  target?: number | "top" | "bottom" | ScrollOptions
+) => Promise<ScrollResult>;
+
 /** Saves a .png, .jpg or .webp of the viewport, or the full page; returns the path. */
 export type Screenshot = (
   path: string,
@@ -173,6 +191,7 @@ export type PageContext = {
   waitFor: WaitFor;
   waitForResponse: WaitForResponse;
   snapshot: Snapshot;
+  scroll: Scroll;
   screenshot: Screenshot;
   click: Click;
   fill: Fill;
@@ -201,6 +220,7 @@ const SETTLE_OPTIONS = ["quietMs", "timeoutMs", "maxInFlight"];
 const GOTO_OPTIONS = ["wait", "quietMs", "timeoutMs", "maxInFlight"];
 const GOTO_WAITS = new Set<GotoWait>(["settle", "dom", "load", "none"]);
 const SNAPSHOT_OPTIONS = ["selector", "maxText", "maxElements"];
+const SCROLL_OPTIONS = ["x", "y", "to", "selector"];
 const TYPE_OPTIONS = ["fast"];
 const FILL_OPTIONS = ["args", "timeoutMs", "intervalMs", "fast", "clear"];
 const RESPONSE_OPTIONS = ["timeoutMs", "body"];
@@ -267,8 +287,8 @@ CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
 Context: { cdp, send, sessionId, targetId, evaluate, goto, settle, waitFor,
-  waitForResponse, snapshot, screenshot, click, fill, type, press, withTab,
-  clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }
+  waitForResponse, snapshot, scroll, screenshot, click, fill, type, press,
+  withTab, clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
@@ -754,7 +774,13 @@ export async function runProbe<T = unknown>(
   let cdp: CdpClient | undefined;
   let cleaning: Promise<void> | undefined;
   let closing = false;
-  // A launched Chrome stops with the probe; a session's Chrome and tab stay.
+  const openTabs = new Set<{
+    targetId: string;
+    sessionId?: string;
+    dispose?: () => void;
+  }>();
+  // A launched Chrome stops with the probe; a session's Chrome and tab stay,
+  // but any child tabs opened by withTab are closed so timeouts never leak them.
   const cleanup = () => {
     cleaning ??= (async () => {
       closing = true;
@@ -768,6 +794,25 @@ export async function runProbe<T = unknown>(
             "an awaitPromise evaluation answers only when its promise settles."
         );
       const client = cdp;
+      if (client && openTabs.size) {
+        const tabs = [...openTabs];
+        openTabs.clear();
+        await Promise.race([
+          Promise.all(
+            tabs.map(async (tab) => {
+              tab.dispose?.();
+              if (tab.sessionId)
+                await client.Target.detachFromTarget({
+                  sessionId: tab.sessionId,
+                }).catch(() => {});
+              await client.Target.closeTarget({
+                targetId: tab.targetId,
+              }).catch(() => {});
+            })
+          ),
+          delay(2000, undefined, { ref: false }),
+        ]);
+      }
       if (chrome)
         await stopChrome(
           chrome,
@@ -1467,6 +1512,36 @@ export async function runProbe<T = unknown>(
           inPageCall(snapshotInPage, selector, maxText, maxElements)
         )) as PageSnapshot;
       };
+      const scroll: Scroll = async (target = 1000) => {
+        let selector: string | null = null;
+        let x: number | null = null;
+        let y: number | null = null;
+        let to: "top" | "bottom" | null = null;
+        if (typeof target === "number") {
+          y = target;
+        } else if (target === "top" || target === "bottom") {
+          to = target;
+        } else if (typeof target === "object" && target !== null) {
+          knownOptions("scroll", target, SCROLL_OPTIONS);
+          selector = target.selector ?? null;
+          x = target.x ?? null;
+          y = target.y ?? null;
+          if (target.to !== undefined) {
+            if (target.to !== "top" && target.to !== "bottom")
+              throw new Error(
+                `scroll: unknown to ${JSON.stringify(target.to)}; use "top" or "bottom"`
+              );
+            to = target.to;
+          }
+        } else {
+          throw new Error(
+            'scroll: pass a pixel delta, "top", "bottom", or { x, y, to, selector }'
+          );
+        }
+        return (await evaluateOnce(
+          inPageCall(scrollInPage, selector, x, y, to)
+        )) as ScrollResult;
+      };
       const screenshot: Screenshot = async (path, opts = {}) => {
         knownOptions("screenshot", opts, ["fullPage"]);
         const format = SCREENSHOT_FORMATS[extname(path).toLowerCase()];
@@ -1497,7 +1572,14 @@ export async function runProbe<T = unknown>(
         const [find, args, label] =
           typeof target === "string"
             ? [
-                (selector: string) => document.querySelector(selector),
+                (selector: string) => {
+                  const all = document.querySelectorAll(selector);
+                  for (const el of all) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return el;
+                  }
+                  return all[0] ?? null;
+                },
                 [target],
                 target,
               ]
@@ -1602,6 +1684,7 @@ export async function runProbe<T = unknown>(
         waitFor,
         waitForResponse,
         snapshot,
+        scroll,
         screenshot,
         click,
         fill,
@@ -1638,21 +1721,28 @@ export async function runProbe<T = unknown>(
         url: "about:blank",
         background: true,
       });
-      let childSessionId: string | undefined;
-      let disposeChild: (() => void) | undefined;
+      const entry: {
+        targetId: string;
+        sessionId?: string;
+        dispose?: () => void;
+      } = { targetId: childTargetId };
+      openTabs.add(entry);
       try {
-        ({ sessionId: childSessionId } = await client.Target.attachToTarget({
-          targetId: childTargetId,
-          flatten: true,
-        }));
+        const { sessionId: childSessionId } =
+          await client.Target.attachToTarget({
+            targetId: childTargetId,
+            flatten: true,
+          });
+        entry.sessionId = childSessionId;
         const bound = await bindPage(childTargetId, childSessionId, false);
-        disposeChild = bound.dispose;
+        entry.dispose = bound.dispose;
         return await fn(bound.page);
       } finally {
-        disposeChild?.();
-        if (childSessionId)
+        openTabs.delete(entry);
+        entry.dispose?.();
+        if (entry.sessionId)
           await client.Target.detachFromTarget({
-            sessionId: childSessionId,
+            sessionId: entry.sessionId,
           }).catch(() => {});
         await client.Target.closeTarget({ targetId: childTargetId }).catch(
           () => {}
@@ -1686,6 +1776,15 @@ export async function runProbe<T = unknown>(
     }
     try {
       return (await run(context)) as T;
+    } catch (error) {
+      if (
+        error instanceof ReferenceError &&
+        /\b(?:document|window|location)\b is not defined/.test(error.message)
+      ) {
+        error.message +=
+          " (probe code runs in Bun, not the browser page — wrap DOM access in evaluate(() => ...))";
+      }
+      throw error;
     } finally {
       main.dispose();
       if (!personal)
