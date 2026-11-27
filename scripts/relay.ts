@@ -195,13 +195,15 @@ process.on("uncaughtException", (error) => void shutdown(error));
 process.on("unhandledRejection", (error) => void shutdown(error));
 
 try {
-  if (config.launch) chrome = await launchChrome(config.launch);
-  if (config.app) chrome = await launchApp(config.app);
+  if (config.launch)
+    chrome = await launchChrome({ ...config.launch, keepSocket: true });
+  if (config.app) chrome = await launchApp(config.app, { keepSocket: true });
 } catch (error) {
   await shutdown(error);
 }
 
-upstream = new WebSocket(chrome?.endpoint ?? config.endpoint ?? "");
+upstream =
+  chrome?.socket ?? new WebSocket(chrome?.endpoint ?? config.endpoint ?? "");
 upstream.addEventListener("error", (event) => void shutdown(event), {
   once: true,
 });
@@ -261,110 +263,112 @@ async function appWindow() {
   throw new Error(`${config.app?.name} opened no window within 30 seconds`);
 }
 
-upstream.addEventListener(
-  "open",
-  async () => {
-    try {
-      const path = `/${randomUUID()}`;
-      let targetId: string | undefined;
-      if (config.app) targetId = await appWindow();
-      else if (chrome) {
-        // The session's tab: every probe in the session continues on it.
-        const [, created] = await Promise.all([
-          call({
-            method: "Browser.setDownloadBehavior",
-            params: profileDownloads(chrome),
-          }),
-          call({
-            method: "Target.createTarget",
-            params: { url: "about:blank", background: true },
-          }),
-        ]);
-        if (created.error) throw new Error(created.error.message);
-        targetId = created.result?.targetId;
-      }
-      server = Bun.serve<Client>({
-        hostname: "127.0.0.1",
-        port: 0,
-        fetch(req, bun) {
-          const { pathname } = new URL(req.url);
-          if (pathname === `${path}/status`) {
-            const status: RelayStatus = { busy, closing: Boolean(stopping) };
-            return Response.json(status);
-          }
-          if (stopping) return new Response("Closing", { status: 503 });
-          const end = pathname === `${path}/end`;
-          if (!end && pathname !== path)
-            return new Response(null, { status: 404 });
-          // One tab, one driver: concurrent probes race on navigation and input.
-          if (!end && chrome && busy)
-            return new Response("Session busy", { status: 409 });
-          if (bun.upgrade(req, { data: { end, queued: [] } })) {
-            if (!end && chrome) busy = true;
-            return;
-          }
-          return new Response("Expected a WebSocket upgrade", { status: 426 });
-        },
-        websocket: {
-          async open(client) {
-            if (client.data.end) {
-              client.close(1000, "Session ending");
-              return void shutdown();
-            }
-            clients.add(client);
-            armIdle();
-            const { result, error } = await call({
-              method: "Target.attachToBrowserTarget",
-            });
-            if (error || !result?.sessionId)
-              return client.close(1011, (error?.message ?? "").slice(0, 120));
-            const browserSession = result.sessionId;
-            client.data.browserSession = browserSession;
-            owners.set(browserSession, { client, browserSession });
-            if (client.readyState !== WebSocket.OPEN) return detachAll(client);
-            for (const data of client.data.queued) forward(client, data);
-            client.data.queued = [];
-          },
-          message(client, data) {
-            const text = String(data);
-            if (client.data.browserSession) forward(client, text);
-            else client.data.queued.push(text);
-          },
-          close(client) {
-            if (client.data.end) return;
-            clients.delete(client);
-            busy = false;
-            detachAll(client);
-            armIdle();
-          },
-        },
-      });
-      const state: RelayState = {
-        pid: process.pid,
-        url: `ws://127.0.0.1:${server.port}${path}`,
-        ...(chrome && {
-          session: config.session,
-          targetId,
-          chromePid: chrome.child.pid,
-          // Unique to this launch: it proves a Chrome left by a killed host is ours.
-          chromeEndpoint: chrome.endpoint,
-          profile: chrome.profile,
-          keptProfile: chrome.kept,
-          headless: Boolean(config.launch?.headless),
-          app: config.app,
-          idleMs,
+const onUpstreamOpen = async () => {
+  try {
+    const path = `/${randomUUID()}`;
+    let targetId: string | undefined;
+    if (config.app) targetId = await appWindow();
+    else if (chrome) {
+      // The session's tab: every probe in the session continues on it.
+      const [, created] = await Promise.all([
+        call({
+          method: "Browser.setDownloadBehavior",
+          params: profileDownloads(chrome),
         }),
-      };
-      await writeFile(`${statePath}.tmp`, JSON.stringify(state), {
-        mode: 0o600,
-      });
-      await rename(`${statePath}.tmp`, statePath);
-      armIdle();
-      process.send?.({ state });
-      process.disconnect?.();
-    } catch (error) {
-      void shutdown(error);
+        call({
+          method: "Target.createTarget",
+          params: { url: "about:blank", background: true },
+        }),
+      ]);
+      if (created.error) throw new Error(created.error.message);
+      targetId = created.result?.targetId;
     }
-  },
-  { once: true }
-);
+    server = Bun.serve<Client>({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req, bun) {
+        const { pathname } = new URL(req.url);
+        if (pathname === `${path}/status`) {
+          const status: RelayStatus = { busy, closing: Boolean(stopping) };
+          return Response.json(status);
+        }
+        if (stopping) return new Response("Closing", { status: 503 });
+        const end = pathname === `${path}/end`;
+        if (!end && pathname !== path)
+          return new Response(null, { status: 404 });
+        // One tab, one driver: concurrent probes race on navigation and input.
+        if (!end && chrome && busy)
+          return new Response("Session busy", { status: 409 });
+        if (bun.upgrade(req, { data: { end, queued: [] } })) {
+          if (!end && chrome) busy = true;
+          return;
+        }
+        return new Response("Expected a WebSocket upgrade", { status: 426 });
+      },
+      websocket: {
+        async open(client) {
+          if (client.data.end) {
+            client.close(1000, "Session ending");
+            return void shutdown();
+          }
+          clients.add(client);
+          armIdle();
+          const { result, error } = await call({
+            method: "Target.attachToBrowserTarget",
+          });
+          if (error || !result?.sessionId)
+            return client.close(1011, (error?.message ?? "").slice(0, 120));
+          const browserSession = result.sessionId;
+          client.data.browserSession = browserSession;
+          owners.set(browserSession, { client, browserSession });
+          if (client.readyState !== WebSocket.OPEN) return detachAll(client);
+          for (const data of client.data.queued) forward(client, data);
+          client.data.queued = [];
+        },
+        message(client, data) {
+          const text = String(data);
+          if (client.data.browserSession) forward(client, text);
+          else client.data.queued.push(text);
+        },
+        close(client) {
+          if (client.data.end) return;
+          clients.delete(client);
+          busy = false;
+          detachAll(client);
+          armIdle();
+        },
+      },
+    });
+    const state: RelayState = {
+      pid: process.pid,
+      url: `ws://127.0.0.1:${server.port}${path}`,
+      ...(chrome && {
+        session: config.session,
+        targetId,
+        chromePid: chrome.child.pid,
+        // Unique to this launch: it proves a Chrome left by a killed host is ours.
+        chromeEndpoint: chrome.endpoint,
+        profile: chrome.profile,
+        keptProfile: chrome.kept,
+        headless: Boolean(config.launch?.headless),
+        app: config.app,
+        idleMs,
+      }),
+    };
+    await writeFile(`${statePath}.tmp`, JSON.stringify(state), {
+      mode: 0o600,
+    });
+    await rename(`${statePath}.tmp`, statePath);
+    armIdle();
+    process.send?.({ state });
+    process.disconnect?.();
+  } catch (error) {
+    void shutdown(error);
+  }
+};
+
+if (upstream.readyState === WebSocket.OPEN) void onUpstreamOpen();
+else
+  upstream.addEventListener("open", () => void onUpstreamOpen(), {
+    once: true,
+  });

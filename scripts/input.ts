@@ -126,7 +126,32 @@ export function watchClickInPage(
   }, []);
 }
 
+const ALT = 1;
+const CONTROL = 2;
+const META = 4;
 const SHIFT = 8;
+
+const MODIFIER_BITS: Record<string, number> = {
+  alt: ALT,
+  option: ALT,
+  control: CONTROL,
+  ctrl: CONTROL,
+  meta: META,
+  cmd: META,
+  command: META,
+  shift: SHIFT,
+};
+
+// macOS Blink editing commands: CDP Input.dispatchKeyEvent with Meta+a/c/v/x/z
+// requires explicit `commands` on macOS to trigger native text-editing actions.
+const MAC_EDIT_COMMANDS: Record<string, string[]> = {
+  [`${META}:a`]: ["selectAll"],
+  [`${META}:c`]: ["copy"],
+  [`${META}:x`]: ["cut"],
+  [`${META}:v`]: ["paste"],
+  [`${META}:z`]: ["undo"],
+  [`${META | SHIFT}:z`]: ["redo"],
+};
 
 // Named keys as Chrome's US layout reports them: [keyCode, text]. Each
 // key's code is its name, except Space's.
@@ -206,36 +231,77 @@ function keyOf(key: string) {
   };
 }
 
-async function stroke(send: Send, key: NonNullable<ReturnType<typeof keyOf>>) {
+async function stroke(
+  send: Send,
+  key: NonNullable<ReturnType<typeof keyOf>>,
+  extraModifiers = 0,
+  commands?: string[]
+) {
+  const modifiers = key.modifiers | extraModifiers;
+  // A chord with Meta/Control/Alt suppresses text insertion unless it's a pure Shift.
+  const hasNonShiftMod = Boolean(modifiers & (ALT | CONTROL | META));
+  const text = hasNonShiftMod ? undefined : key.text;
   const common = {
     key: key.key,
     code: key.code,
     windowsVirtualKeyCode: key.keyCode,
-    modifiers: key.modifiers,
+    modifiers,
   };
   // Chrome types the text of a keyDown; a key without text is a rawKeyDown.
   await send("Input.dispatchKeyEvent", {
-    type: key.text ? "keyDown" : "rawKeyDown",
+    type: text ? "keyDown" : "rawKeyDown",
     ...common,
-    text: key.text,
-    unmodifiedText: key.text,
+    text,
+    unmodifiedText: text,
+    ...(commands ? { commands } : {}),
   });
   await pause(10, 15);
   await send("Input.dispatchKeyEvent", { type: "keyUp", ...common });
 }
 
-/** Presses one key: a named key such as "Enter", or a US layout character. */
+function parseChord(input: string) {
+  if (input.length <= 1 || !input.includes("+")) {
+    const known = keyOf(input);
+    return known
+      ? { key: known, modifiers: 0, commands: undefined }
+      : undefined;
+  }
+  // Support chords like "Meta+a", "Shift+Tab", "Meta+Shift+z", or "Meta++".
+  const parts = input.endsWith("++")
+    ? [...input.slice(0, -2).split("+"), "+"]
+    : input.split("+");
+  const baseName = parts.pop();
+  if (!baseName || !parts.length) return undefined;
+  let modifiers = 0;
+  for (const part of parts) {
+    const bit = MODIFIER_BITS[part.toLowerCase()];
+    if (!bit) return undefined;
+    modifiers |= bit;
+  }
+  const known = keyOf(baseName);
+  if (!known) return undefined;
+  const commands =
+    MAC_EDIT_COMMANDS[
+      `${modifiers | known.modifiers}:${known.key.toLowerCase()}`
+    ];
+  return { key: known, modifiers, commands };
+}
+
+/**
+ * Presses one key or modifier chord: a named key ("Enter"), US layout character
+ * ("-"), or chord ("Meta+a", "Shift+Tab", "Control+c").
+ */
 export async function press(send: Send, key: string) {
-  const known = keyOf(key);
-  if (!known)
+  const parsed = parseChord(key);
+  if (!parsed)
     throw new Error(
-      `press: unknown key ${JSON.stringify(key)}; use a US key character or one of ${Object.keys(
+      `press: unknown key ${JSON.stringify(key)}; use a US key character, chord (e.g. "Meta+a"), or one of ${Object.keys(
         NAMED_KEYS
       )
         .map((name) => JSON.stringify(name))
         .join(", ")}`
     );
-  await stroke(send, known);
+  await stroke(send, parsed.key, parsed.modifiers, parsed.commands);
 }
 
 /**

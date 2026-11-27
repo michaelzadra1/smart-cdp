@@ -86,8 +86,20 @@ for remote objects; release retained handles after use.
 
 ## Capture responses
 
-Enable Network before navigation. Correlate responses and completion by request
-ID, and filter by the bound session. Capture only task-relevant URLs:
+For a single API response, use the built-in `waitForResponse(match, { timeoutMs,
+body })` — start it before the navigation or click that triggers the request so
+there is no race. It waits for `Network.loadingFinished`, decodes base64
+automatically and parses JSON when valid:
+
+```js
+const pending = waitForResponse("/api/search");
+await click("button[type=submit]");
+const { status, json } = await pending;
+```
+
+For multiple responses or custom filtering, `Network` is already enabled on
+every probe — correlate `Network.responseReceived` and `Network.loadingFinished`
+by `requestId`, scoped to the bound session:
 
 ```js
 await send("Network.enable");

@@ -15,7 +15,7 @@ description: >-
   repository's production runtime or infrastructure.
 metadata:
   author: Michael Zadra
-  version: "6.5.0"
+  version: "6.6.0"
 ---
 
 # Smart CDP
@@ -50,12 +50,14 @@ diagnostics go to stderr. Default deadline is 120 s (`--timeout-ms`).
 
 | Context helper | Behavior |
 | --- | --- |
-| `goto(url, { wait, quietMs, timeoutMs })` | Navigates and waits: `"settle"` (default: parsed DOM + 300 ms network quiet, 5 s cap, ignoring SSE/WebSocket/Media/beacons), `"dom"` (`DOMContentLoaded`, fast before `waitFor`), `"load"`, or `"none"`. Returns `{ url, status, settled }`; failed navigation throws |
+| `goto(url, { wait, quietMs, timeoutMs, maxInFlight })` | Navigates and waits: `"settle"` (default: parsed DOM + 300 ms quiet, 5 s cap, ignoring SSE/WebSocket/Media/beacons; pass `maxInFlight: 2` on polling/ad-heavy pages), `"dom"` (`DOMContentLoaded`, fast before `waitFor`), `"load"`, or `"none"`. Returns `{ url, status, settled }` |
 | `snapshot({ selector, maxText, maxElements })` | Returns `{ url, title, text, elements }` with collapsed visible text (3,000 chars) and visible interactive controls with verified CSS selectors ready for `click()` (60 max) |
 | `evaluate(fn, ...args)` | Runs a self-contained page function with JSON args and returns its JSON value (returning a DOM element throws) |
 | `waitFor(fn, { args, timeoutMs, intervalMs })` | Event-driven on DOM mutations and page events (plus host fallback); returns the first truthy value, survives redirects/reloads, throws after `timeoutMs` (15 s) with a page preview |
-| `settle({ quietMs, timeoutMs })` | Event-driven wait for parsed DOM and no non-streaming requests in flight for `quietMs` (300 ms); `false` after `timeoutMs` (5 s) |
-| `click`, `type`, `press` | Trusted CDP input; see [Acting on a page](#acting-on-a-page) |
+| `waitForResponse(match, { timeoutMs, body })` | Event-driven capture of the next response whose URL matches a string, `RegExp` or predicate `(info) => boolean`; waits for `loadingFinished` and returns `{ url, status, headers, mimeType, body, json }` (15 s default). Start it before the action that triggers the request |
+| `settle({ quietMs, timeoutMs, maxInFlight })` | Event-driven wait for parsed DOM and at most `maxInFlight` (0) non-streaming requests open for `quietMs` (300 ms); `false` after `timeoutMs` (5 s) |
+| `withTab(async (tab) => ...)` | Opens a background tab in the same Chrome with the full page helper set (`goto`, `waitFor`, `waitForResponse`, `snapshot`, `evaluate`, `click`, `fill`, ...) and closes it in `finally`; ideal for reading 3–8 URLs in parallel (`Promise.all`). Unavailable in `--personal` |
+| `click`, `fill`, `type`, `press` | Trusted CDP input; see [Acting on a page](#acting-on-a-page) |
 | `screenshot(path, { fullPage })` | Captures `.png`, `.jpg` or `.webp` (creating parent dirs) and returns its absolute path |
 | `send(method, params)` | Sends any CDP command to the bound page |
 | `cdp`, `sessionId`, `targetId` | Browser-level CDP client and page IDs for events, targets and popups ([PROTOCOL.md](references/PROTOCOL.md)) |
@@ -82,9 +84,13 @@ probes ([LIFECYCLE.md](references/LIFECYCLE.md#signing-in)).
   with `settle()`. When `waitFor(...)` follows `goto`, pass `{ wait: "dom" }` so
   `waitFor` starts immediately instead of waiting for network quiet first.
 - **Wait on events and state, not fixed sleeps.** After an action, use `waitFor`
-  for the target state (or `settle()` when you cannot name it). Keep fixed
-  sleeps only inside a loop whose body is the work (scroll dwell, request
-  pacing). A long in-page `evaluate` loop breaks on redirects or reloads.
+  for the target state, `waitForResponse` for the API response it triggers, or
+  `settle()` when you cannot name either. Keep fixed sleeps only inside a loop
+  whose body is the work (scroll dwell, request pacing).
+- **Read multiple URLs in parallel with `withTab`.** Rather than looping `goto`
+  sequentially on one tab, fan out a handful of URLs in parallel inside one
+  probe with `Promise.all(urls.map((u) => withTab(async (tab) => ...)))` (cap
+  concurrency for rate-limited sites).
 - **Inspect once with `snapshot()`, then batch the step.** On an unfamiliar
   page, call `goto(url)` + `return await snapshot()` to get compact text and
   exact `click()` selectors instead of writing ad-hoc DOM queries or guessing
@@ -102,17 +108,18 @@ probes ([LIFECYCLE.md](references/LIFECYCLE.md#signing-in)).
 await click("button[aria-label='Year']"); // CSS selector, or finder fn
 await click((t) => [...document.querySelectorAll("[role=option]")]
   .find((o) => o.textContent.trim() === t), { args: ["2024"] });
-await click("input[name=q]");
-await type("ada@example.com"); // trusted keystrokes; { fast: true } inserts at once
-await press("Enter"); // named key ("Escape", "Tab", "ArrowDown", ...) or US char
+await fill("input[name=q]", "ada@example.com"); // clicks, clears (Meta+a + Backspace), types
+await press("Enter"); // named key, US char ("-"), or chord ("Meta+a", "Shift+Tab")
 ```
 
 `click` checks immediately, then waits event-driven up to `timeoutMs` (10 s)
 until the target is visible, steady and uncovered, scrolls it into view and
-presses its center. On timeout it reports missing, zero-size or the covering
-element. Use `type(text, { fast: true })` for long non-sensitive queries or
-filters; keep default keystroke typing on sign-in or bot-sensitive forms. For
-hover, drag or scroll, send `Input.*` ([PROTOCOL.md](references/PROTOCOL.md#screenshots-and-input)).
+presses its center. On timeout it reports missing (with visible controls),
+zero-size or the covering element. `fill(target, text, { fast, clear })` clicks,
+clears existing text unless `clear: false`, and types; use `{ fast: true }` on
+`fill` or `type` for long non-sensitive queries/filters and keep default
+keystrokes on sign-in or bot-sensitive forms. For hover, drag or scroll, send
+`Input.*` ([PROTOCOL.md](references/PROTOCOL.md#screenshots-and-input)).
 
 Do not trigger actions from page JavaScript (`el.click()`, `focus()`,
 `select()`, `dispatchEvent`, assigning `value`): those set `isTrusted: false`

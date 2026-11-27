@@ -11,7 +11,7 @@ import { type AddressInfo, createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { browserEndpoint, connect } from "./cdp";
+import { browserEndpoint, type CdpClient, connect } from "./cdp";
 
 /** A launched Chrome, or Electron app, that this process owns. */
 export type Chrome = {
@@ -20,6 +20,10 @@ export type Chrome = {
   /** A --profile the caller keeps; otherwise a temp profile stopChrome removes. */
   kept: boolean;
   endpoint?: string;
+  /** Open, PID-verified CDP client when launchChrome/launchBrowser was asked to keep it. */
+  client?: CdpClient;
+  /** Open, PID-verified raw WebSocket when launchBrowser was asked to keep it. */
+  socket?: WebSocket;
   exited: Promise<unknown>;
   running: () => boolean;
   /** Downloads still running, by guid, which stopChrome cancels before closing. */
@@ -186,10 +190,14 @@ async function disablePasswordManager(profile: string) {
 export async function launchChrome({
   headless,
   profile: keptProfile,
+  keepClient,
+  keepSocket,
   log,
 }: {
   headless?: boolean;
   profile?: string;
+  keepClient?: boolean;
+  keepSocket?: boolean;
   log?: (line: string) => void;
 }): Promise<Chrome> {
   const makeProfile = async () => {
@@ -205,6 +213,8 @@ export async function launchChrome({
     binary,
     profile,
     kept: Boolean(keptProfile),
+    keepClient,
+    keepSocket,
     args: [
       "--no-first-run",
       "--no-default-browser-check",
@@ -213,6 +223,70 @@ export async function launchChrome({
     ],
     log,
   });
+}
+
+// Opens one raw WebSocket to `endpoint`, verifies the browser PID via
+// SystemInfo.getProcessInfo, and returns the live open socket so callers
+// (like relay.ts) avoid a redundant second WebSocket handshake.
+async function connectAndVerifySocket(
+  endpoint: string,
+  expectedPid: number | undefined,
+  port: number
+): Promise<WebSocket> {
+  const ws = new WebSocket(endpoint);
+  try {
+    await new Promise<void>((resolveOpen, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`CDP handshake timed out on port ${port}`)),
+        20_000
+      );
+      ws.addEventListener(
+        "open",
+        () => {
+          clearTimeout(timer);
+          resolveOpen();
+        },
+        { once: true }
+      );
+      ws.addEventListener(
+        "error",
+        () => {
+          clearTimeout(timer);
+          reject(new Error(`CDP socket failed on port ${port}`));
+        },
+        { once: true }
+      );
+    });
+    const processInfo = await new Promise<
+      { type: string; id: number }[] | undefined
+    >((resolveInfo, reject) => {
+      const id = 999_999;
+      const onMessage = (event: MessageEvent) => {
+        const msg = JSON.parse(String(event.data)) as {
+          id?: number;
+          result?: { processInfo?: { type: string; id: number }[] };
+          error?: { message: string };
+        };
+        if (msg.id !== id) return;
+        ws.removeEventListener("message", onMessage);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolveInfo(msg.result?.processInfo);
+      };
+      ws.addEventListener("message", onMessage);
+      ws.addEventListener(
+        "close",
+        () => reject(new Error(`CDP socket closed before PID check`)),
+        { once: true }
+      );
+      ws.send(JSON.stringify({ id, method: "SystemInfo.getProcessInfo" }));
+    });
+    if (processInfo?.find((p) => p.type === "browser")?.id !== expectedPid)
+      throw new Error(`Port ${port} belongs to another browser`);
+    return ws;
+  } catch (error) {
+    ws.close();
+    throw error;
+  }
 }
 
 /**
@@ -226,6 +300,8 @@ export async function launchBrowser({
   binary,
   profile,
   kept = false,
+  keepClient = false,
+  keepSocket = false,
   args = [],
   log,
   onSpawn,
@@ -236,6 +312,10 @@ export async function launchBrowser({
   profile: string;
   /** A profile the caller keeps; otherwise stopChrome removes it. */
   kept?: boolean;
+  /** Keep the verified CdpClient open on `chrome.client` instead of closing it. */
+  keepClient?: boolean;
+  /** Keep the verified raw WebSocket open on `chrome.socket` instead of closing it. */
+  keepSocket?: boolean;
   args?: string[];
   log?: (line: string) => void;
   onSpawn?: (pid: number) => void;
@@ -289,14 +369,26 @@ export async function launchBrowser({
         await delay(20);
       }
     }
-    // The reserved port was briefly free: prove the endpoint is our child.
-    const check = await connect(chrome.endpoint);
-    try {
-      const { processInfo } = await check.SystemInfo.getProcessInfo();
-      if (processInfo.find((p) => p.type === "browser")?.id !== child.pid)
-        throw new Error(`Port ${port} belongs to another browser`);
-    } finally {
-      await check.close();
+    // The reserved port was briefly free: prove the endpoint is our child,
+    // reusing the same connection when the caller wants it.
+    if (keepSocket) {
+      chrome.socket = await connectAndVerifySocket(
+        chrome.endpoint,
+        child.pid,
+        port
+      );
+    } else {
+      const check = await connect(chrome.endpoint);
+      try {
+        const { processInfo } = await check.SystemInfo.getProcessInfo();
+        if (processInfo.find((p) => p.type === "browser")?.id !== child.pid)
+          throw new Error(`Port ${port} belongs to another browser`);
+        if (keepClient) chrome.client = check;
+      } catch (error) {
+        await check.close().catch(() => {});
+        throw error;
+      }
+      if (!keepClient) await check.close();
     }
     return chrome;
   } catch (error) {

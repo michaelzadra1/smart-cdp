@@ -78,11 +78,16 @@ export type Click = <A extends unknown[]>(
   options?: PollOptions<A>
 ) => Promise<void>;
 
-type SettleOptions = { quietMs?: number; timeoutMs?: number };
+type SettleOptions = {
+  quietMs?: number;
+  timeoutMs?: number;
+  maxInFlight?: number;
+};
 
 /**
- * Waits event-driven until the document is parsed and the page has had no
- * non-streaming request in flight for `quietMs`; false after `timeoutMs`.
+ * Waits event-driven until the document is parsed and at most `maxInFlight`
+ * (default 0) non-streaming requests remain open for `quietMs`; false after
+ * `timeoutMs`.
  */
 export type Settle = (options?: SettleOptions) => Promise<boolean>;
 
@@ -111,15 +116,54 @@ export type Snapshot = (options?: SnapshotOptions) => Promise<PageSnapshot>;
 
 type TypeOptions = { fast?: boolean };
 
+type FillOptions<A> = PollOptions<A> & { fast?: boolean; clear?: boolean };
+
+/** Clicks the element, clears it with trusted Meta+a + Backspace (unless clear: false), then types text. */
+export type Fill = <A extends unknown[]>(
+  target: string | ((...args: A) => Element | null | undefined),
+  text: string,
+  options?: FillOptions<A>
+) => Promise<void>;
+
+export type ResponseMatch =
+  | string
+  | RegExp
+  | ((info: {
+      url: string;
+      status: number;
+      method?: string;
+      mimeType: string;
+    }) => boolean);
+
+export type WaitForResponseOptions = {
+  timeoutMs?: number;
+  /** Default true. Set false when you only need status and headers. */
+  body?: boolean;
+};
+
+export type CapturedResponse = {
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+  mimeType: string;
+  body?: string;
+  json?: unknown;
+};
+
+/** Event-driven capture of the next matching network response and its completed body. */
+export type WaitForResponse = (
+  match: ResponseMatch,
+  options?: WaitForResponseOptions
+) => Promise<CapturedResponse>;
+
 /** Saves a .png, .jpg or .webp of the viewport, or the full page; returns the path. */
 export type Screenshot = (
   path: string,
   options?: { fullPage?: boolean }
 ) => Promise<string>;
 
-/** What a probe (stdin body or --file default export) receives. */
-export type ProbeContext = {
-  cdp: CdpClient;
+/** Page-bound helpers shared by the main tab and any background tab opened with `withTab`. */
+export type PageContext = {
   send: Send;
   sessionId: string;
   targetId: string;
@@ -127,9 +171,11 @@ export type ProbeContext = {
   goto: Goto;
   settle: Settle;
   waitFor: WaitFor;
+  waitForResponse: WaitForResponse;
   snapshot: Snapshot;
   screenshot: Screenshot;
   click: Click;
+  fill: Fill;
   type: (text: string, options?: TypeOptions) => Promise<void>;
   press: (key: string) => Promise<void>;
   clickRecaptchaCheckbox: () => Promise<boolean>;
@@ -137,16 +183,27 @@ export type ProbeContext = {
   holdPressAndHoldButton: () => Promise<PressAndHoldResult | false>;
 };
 
+/** Opens a background tab in the same browser with full PageContext helpers and closes it in finally. */
+export type WithTab = <T>(fn: (tab: PageContext) => Promise<T>) => Promise<T>;
+
+/** What a probe (stdin body or --file default export) receives. */
+export type ProbeContext = PageContext & {
+  cdp: CdpClient;
+  withTab: WithTab;
+};
+
 export type Probe<T = unknown> = (context: ProbeContext) => Promise<T>;
 
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
-const SETTLE_OPTIONS = ["quietMs", "timeoutMs"];
-const GOTO_OPTIONS = ["wait", "quietMs", "timeoutMs"];
+const SETTLE_OPTIONS = ["quietMs", "timeoutMs", "maxInFlight"];
+const GOTO_OPTIONS = ["wait", "quietMs", "timeoutMs", "maxInFlight"];
 const GOTO_WAITS = new Set<GotoWait>(["settle", "dom", "load", "none"]);
 const SNAPSHOT_OPTIONS = ["selector", "maxText", "maxElements"];
 const TYPE_OPTIONS = ["fast"];
+const FILL_OPTIONS = ["args", "timeoutMs", "intervalMs", "fast", "clear"];
+const RESPONSE_OPTIONS = ["timeoutMs", "body"];
 const SCREENSHOT_FORMATS: Record<string, "png" | "jpeg" | "webp"> = {
   ".png": "png",
   ".jpg": "jpeg",
@@ -210,16 +267,19 @@ CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
 Context: { cdp, send, sessionId, targetId, evaluate, goto, settle, waitFor,
-  snapshot, screenshot, click, type, press, clickRecaptchaCheckbox,
-  clickTurnstileCheckbox, holdPressAndHoldButton }
+  waitForResponse, snapshot, screenshot, click, fill, type, press, withTab,
+  clickRecaptchaCheckbox, clickTurnstileCheckbox, holdPressAndHoldButton }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
-goto(url, { wait = "settle", quietMs, timeoutMs }) navigates and waits:
+goto(url, { wait = "settle", quietMs, timeoutMs, maxInFlight }) navigates and waits:
   "settle" (default: event-driven DOM + quiet network), "dom" (DOMContentLoaded,
   fast before waitFor), "load" (load event), or "none". Returns { url, status, settled }.
-settle({ quietMs = 300, timeoutMs = 5000 }) waits event-driven until the document
-is parsed and no non-streaming request has been in flight for quietMs; false on timeout.
+settle({ quietMs = 300, timeoutMs = 5000, maxInFlight = 0 }) waits event-driven
+until the document is parsed and at most maxInFlight non-streaming requests remain
+open for quietMs; false on timeout.
+waitForResponse(match, { timeoutMs = 15000, body = true }) waits event-driven for a
+matching network response to finish loading and returns { url, status, headers, mimeType, body, json }.
 snapshot({ selector, maxText = 3000, maxElements = 60 }) returns normalized page
 text plus visible interactive elements with verified CSS selectors for click().
 screenshot(path, { fullPage }) saves a .png, .jpg or .webp, creating its folder,
@@ -228,8 +288,12 @@ waitFor(fn, { args, timeoutMs = 15000, intervalMs = 250 }) returns fn's first tr
 value, event-driven on DOM/page changes with host fallback; survives redirects.
 click(selector | fn, { args, timeoutMs = 10000, intervalMs = 150 }) waits event-driven
 until visible and uncovered, then sends trusted mouse input.
+fill(selector | fn, text, { args, timeoutMs, fast, clear }) clicks, clears with
+trusted Meta+a + Backspace, and types text.
 type(text, { fast }) sends trusted keystrokes (or instant Input.insertText with fast: true).
-press(key) presses a named key ("Enter", "Escape", ...) or US layout character.
+press(key) presses a named key ("Enter"), US char ("-"), or chord ("Meta+a", "Shift+Tab").
+withTab(async (tab) => ...) opens a background tab with the same page helpers for
+parallel multi-URL work and closes it in finally.
 Returns JSON on stdout. Lifecycle diagnostics go to stderr.
 `;
 
@@ -760,12 +824,13 @@ export async function runProbe<T = unknown>(
       chrome = await launchChrome({
         headless: options.headless,
         profile: options.profile,
+        keepClient: true,
         log: console.error,
       });
       endpoint = chrome.endpoint ?? "";
     }
     try {
-      cdp = await connect(validWebSocket(endpoint));
+      cdp = chrome?.client ?? (await connect(validWebSocket(endpoint)));
     } catch (error) {
       const status = session && (await relayStatus(session.url));
       if (session && status?.closing)
@@ -856,464 +921,748 @@ export async function runProbe<T = unknown>(
         flatten: true,
       }));
     }
-    const send: Send = (method, params) =>
-      client.send(method, params ?? {}, sessionId);
-    // "Leave site?" blocks Page.navigate and every command after it until
-    // someone answers, and a real CDP click is enough to arm it. A personal
-    // session's host answers for its tab, including while the tab closes.
-    if (!personal) {
-      client.on(
-        `Page.javascriptDialogOpening.${sessionId}`,
-        ({ type }: { type: string }) => {
-          if (type === "beforeunload")
-            void send("Page.handleJavaScriptDialog", { accept: true }).catch(
-              () => {}
-            );
-        }
-      );
-    }
-    const [network] = await Promise.all([
-      trackNetwork(client, send, sessionId),
-      !personal && send("Page.enable"),
-    ]);
-    const evaluateOnce = async (expression: string) => {
-      const result = await send("Runtime.evaluate", {
-        expression,
-        returnByValue: true,
-        awaitPromise: true,
-      });
-      if (result.exceptionDetails)
-        throw new Error(
-          result.exceptionDetails.exception?.description ??
-            result.exceptionDetails.text
-        );
-      return result.result.value;
-    };
-    const evaluateValue = async <A extends unknown[]>(
-      fn: (...args: A) => unknown,
-      args: A
-    ) => {
-      const result = await evaluateOnce(
-        inPageCall(returnByValueInPage, fn, args)
-      );
-      if (result.node) throw new ReturnedNodeError();
-      return result.value;
-    };
-    const evaluate: Evaluate = (fn, ...args) =>
-      evaluateValue(fn, args).catch((error: Error) => {
-        if (error instanceof CdpProtocolError && navigated.test(error.message))
-          error.message +=
-            ". The page navigated while evaluate ran; wait for the new page with waitFor()";
-        throw error;
-      });
-    const pageUrl = async () => {
-      const { targetInfos } = await client.Target.getTargets().catch(() => ({
-        targetInfos: [],
-      }));
-      // A personal tab's host has no Target domain to ask, so ask the page;
-      // only a page that cannot answer either has closed.
-      const url =
-        targetInfos.find((target) => target.targetId === targetId)?.url ??
-        (await Promise.race([
-          evaluate(() => location.href).catch(() => null),
-          delay(2000, null, { ref: false }),
-        ]));
-      return typeof url === "string" ? url : "a closed page";
-    };
-    const pagePreview = async () => {
-      const preview = (await Promise.race([
-        evaluateOnce(inPageCall(pagePreviewInPage)).catch(() => null),
-        delay(1000, null, { ref: false }),
-      ])) as { title?: unknown; text?: unknown } | null;
-      if (!preview || typeof preview.title !== "string") return "";
-      const text = typeof preview.text === "string" ? preview.text : "";
-      if (!preview.title && !text) return "";
-      const parts = [
-        preview.title ? `title=${JSON.stringify(preview.title)}` : "",
-        text ? `text=${JSON.stringify(text)}` : "",
-      ].filter(Boolean);
-      return `; page ${parts.join(" ")}`;
-    };
-    // Tries from the host with short evaluations until `done` accepts a
-    // value: a redirect or reload between tries costs one retry, where one
-    // long in-page wait fails outright. Resolves with that value as `found`,
-    // or at the deadline with the last value or page error.
-    const until = async (
-      attempt: () => Promise<unknown>,
-      timeoutMs: number,
-      intervalMs: number,
-      done: (value: unknown) => boolean,
-      /** Ends it quietly, with undefined: something else answered. */
-      stopped?: AbortSignal,
-      initial?: { delayMs?: number; last?: unknown; lastError?: Error }
-    ) => {
-      const deadline = Date.now() + timeoutMs;
-      const late = Symbol("late");
-      let last: unknown = initial?.last;
-      let lastError: Error | undefined = initial?.lastError;
-      if (initial?.delayMs && initial.delayMs > 0) {
-        const wait = Math.min(
-          initial.delayMs,
-          Math.max(deadline - Date.now(), 0)
-        );
-        if (wait > 0)
-          await delay(wait, undefined, { signal: stopped }).catch(() => {});
+    // Builds all page-bound helpers for a target session (both the main tab
+    // and any background tab opened with `withTab`). `dispose` cleans up all
+    // CDP listeners registered on `client` for that session.
+    const bindPage = async (
+      boundTargetId: string,
+      boundSessionId: string,
+      isPersonal: boolean
+    ): Promise<{ page: PageContext; dispose: () => void }> => {
+      const send: Send = (method, params) =>
+        client.send(method, params ?? {}, boundSessionId);
+      const disposers = new Set<() => void>();
+      // "Leave site?" blocks Page.navigate and every command after it until
+      // someone answers, and a real CDP click is enough to arm it. A personal
+      // session's host answers for its tab, including while the tab closes.
+      const onDialog = ({ type: dialogType }: { type: string }) => {
+        if (dialogType === "beforeunload")
+          void send("Page.handleJavaScriptDialog", { accept: true }).catch(
+            () => {}
+          );
+      };
+      if (!isPersonal) {
+        client.on(`Page.javascriptDialogOpening.${boundSessionId}`, onDialog);
       }
-      for (;;) {
-        if (stopped?.aborted) return undefined;
-        const remaining = Math.max(deadline - Date.now(), 0);
-        if (remaining === 0 && (last !== undefined || lastError !== undefined))
-          break;
-        const trying = attempt();
-        trying.catch(() => {});
-        try {
-          const value = await Promise.race([
-            trying,
-            delay(remaining, late, { ref: false }),
-          ]);
-          if (value === late) break;
-          if (done(value)) return { found: value };
-          last = value;
-          lastError = undefined;
-        } catch (error) {
-          const failure = error as Error;
-          // A page exception, often a document still loading, is not a
-          // protocol error.
+      const [network] = await Promise.all([
+        trackNetwork(client, send, boundSessionId),
+        !isPersonal && send("Page.enable"),
+      ]);
+      const evaluateOnce = async (expression: string) => {
+        const result = await send("Runtime.evaluate", {
+          expression,
+          returnByValue: true,
+          awaitPromise: true,
+        });
+        if (result.exceptionDetails)
+          throw new Error(
+            result.exceptionDetails.exception?.description ??
+              result.exceptionDetails.text
+          );
+        return result.result.value;
+      };
+      const evaluateValue = async <A extends unknown[]>(
+        fn: (...args: A) => unknown,
+        args: A
+      ) => {
+        const result = await evaluateOnce(
+          inPageCall(returnByValueInPage, fn, args)
+        );
+        if (result.node) throw new ReturnedNodeError();
+        return result.value;
+      };
+      const evaluate: Evaluate = (fn, ...args) =>
+        evaluateValue(fn, args).catch((error: Error) => {
           if (
-            failure instanceof ReturnedNodeError ||
-            (failure instanceof CdpProtocolError &&
-              !navigated.test(failure.message))
+            error instanceof CdpProtocolError &&
+            navigated.test(error.message)
           )
-            throw failure;
-          lastError = failure;
+            error.message +=
+              ". The page navigated while evaluate ran; wait for the new page with waitFor()";
+          throw error;
+        });
+      const pageUrl = async () => {
+        const { targetInfos } = await client.Target.getTargets().catch(() => ({
+          targetInfos: [],
+        }));
+        // A personal tab's host has no Target domain to ask, so ask the page;
+        // only a page that cannot answer either has closed.
+        const url =
+          targetInfos.find((target) => target.targetId === boundTargetId)
+            ?.url ??
+          (await Promise.race([
+            evaluate(() => location.href).catch(() => null),
+            delay(2000, null, { ref: false }),
+          ]));
+        return typeof url === "string" ? url : "a closed page";
+      };
+      const pagePreview = async () => {
+        const preview = (await Promise.race([
+          evaluateOnce(inPageCall(pagePreviewInPage)).catch(() => null),
+          delay(1000, null, { ref: false }),
+        ])) as { title?: unknown; text?: unknown } | null;
+        if (!preview || typeof preview.title !== "string") return "";
+        const text = typeof preview.text === "string" ? preview.text : "";
+        if (!preview.title && !text) return "";
+        const parts = [
+          preview.title ? `title=${JSON.stringify(preview.title)}` : "",
+          text ? `text=${JSON.stringify(text)}` : "",
+        ].filter(Boolean);
+        return `; page ${parts.join(" ")}`;
+      };
+      const visibleControlsHint = async () => {
+        const snap = (await Promise.race([
+          evaluateOnce(inPageCall(snapshotInPage, null, 0, 10)).catch(
+            () => null
+          ),
+          delay(1000, null, { ref: false }),
+        ])) as PageSnapshot | null;
+        if (!snap || !Array.isArray(snap.elements) || !snap.elements.length)
+          return "";
+        const items = snap.elements.map((el) => {
+          const label = el.text ?? el.placeholder ?? el.type ?? "";
+          return label
+            ? `${el.tag} ${JSON.stringify(label.slice(0, 40))} (${el.selector})`
+            : `${el.tag} (${el.selector})`;
+        });
+        return `; visible controls: ${items.join(", ")}`;
+      };
+      // Tries from the host with short evaluations until `done` accepts a
+      // value: a redirect or reload between tries costs one retry, where one
+      // long in-page wait fails outright. Resolves with that value as `found`,
+      // or at the deadline with the last value or page error.
+      const until = async (
+        attempt: () => Promise<unknown>,
+        timeoutMs: number,
+        intervalMs: number,
+        done: (value: unknown) => boolean,
+        /** Ends it quietly, with undefined: something else answered. */
+        stopped?: AbortSignal,
+        initial?: { delayMs?: number; last?: unknown; lastError?: Error }
+      ) => {
+        const deadline = Date.now() + timeoutMs;
+        const late = Symbol("late");
+        let last: unknown = initial?.last;
+        let lastError: Error | undefined = initial?.lastError;
+        if (initial?.delayMs && initial.delayMs > 0) {
+          const wait = Math.min(
+            initial.delayMs,
+            Math.max(deadline - Date.now(), 0)
+          );
+          if (wait > 0)
+            await delay(wait, undefined, { signal: stopped }).catch(() => {});
         }
-        if (Date.now() >= deadline) break;
-        await delay(intervalMs, undefined, { signal: stopped }).catch(() => {});
-      }
-      return { last, lastError };
-    };
-    // `until`, for waitFor and click: throws at the deadline, and `explain`
-    // words the last value or page error.
-    const poll = async (
-      name: string,
-      attempt: () => Promise<unknown>,
-      options: PollOptions<unknown[]>,
-      defaults: { timeoutMs: number; intervalMs: number },
-      done: (value: unknown) => boolean,
-      explain: (last: unknown, lastError?: string) => Promise<string> | string,
-      stopped?: AbortSignal,
-      initial?: { delayMs?: number; last?: unknown; lastError?: Error }
-    ) => {
-      const timeoutMs = options.timeoutMs ?? defaults.timeoutMs;
-      const intervalMs = options.intervalMs ?? defaults.intervalMs;
-      const result = await until(
-        attempt,
-        timeoutMs,
-        intervalMs,
-        done,
-        stopped,
-        initial
-      );
-      if (!result || "found" in result) return result?.found;
-      throw new Error(
-        `${name} timed out after ${timeoutMs}ms on ${await pageUrl()}` +
-          (await explain(result.last, result.lastError?.message.split("\n")[0]))
-      );
-    };
-    // Settles with the watch expression's first truthy value from the page,
-    // which re-checks on DOM changes and page events, unless the host poll
-    // gets there first. A new document ends a watch, so it is re-installed.
-    const watch = async (
-      expression: string,
-      ended: AbortSignal
-    ): Promise<{ value: unknown } | undefined> => {
-      while (!ended.aborted) {
-        let objectId: string | undefined;
-        const stop = () => {
-          if (objectId)
-            void send("Runtime.callFunctionOn", {
-              objectId,
-              functionDeclaration: String(stopWatchInPage),
-            }).catch(() => {});
-        };
-        try {
-          const handle = await send("Runtime.evaluate", { expression });
-          objectId = handle.result.objectId;
-          if (handle.exceptionDetails || !objectId) break;
-          ended.addEventListener("abort", stop, { once: true });
-          if (ended.aborted) stop();
-          const { result } = await send("Runtime.callFunctionOn", {
-            objectId,
-            functionDeclaration: String(changedInPage),
-            awaitPromise: true,
-            returnByValue: true,
-          });
-          const outcome: WatchResult = result.value;
-          if (outcome && "node" in outcome) throw new ReturnedNodeError();
-          if (outcome) return { value: outcome.value };
-          break;
-        } catch (error) {
-          if (error instanceof ReturnedNodeError) throw error;
+        for (;;) {
+          if (stopped?.aborted) return undefined;
+          const remaining = Math.max(deadline - Date.now(), 0);
           if (
-            !(error instanceof CdpProtocolError) ||
-            !navigated.test(error.message)
+            remaining === 0 &&
+            (last !== undefined || lastError !== undefined)
           )
             break;
-          await delay(50);
-        } finally {
-          ended.removeEventListener("abort", stop);
-          if (objectId)
-            await send("Runtime.releaseObject", { objectId }).catch(() => {});
-        }
-      }
-      return undefined;
-    };
-    // Answers as the page changes, through watch; the host poll still covers
-    // what no event announces, such as script state or a page with scripts off.
-    const waitFor: WaitFor = async (fn, options = {}) => {
-      knownOptions("waitFor", options, POLL_OPTIONS);
-      const args = options.args ?? ([] as never);
-      const timeoutMs = options.timeoutMs ?? 15000;
-      const intervalMs = options.intervalMs ?? 250;
-      const ended = new AbortController();
-      const watching = watch(inPageCall(watchInPage, fn, args), ended.signal);
-      // Without a watch, as on a page with scripts off, the poll alone answers.
-      const changed = watching.then((found) =>
-        found ? found.value : new Promise<never>(() => {})
-      );
-      changed.catch(() => {});
-      try {
-        return (await Promise.race([
-          poll(
-            "waitFor",
-            () => evaluateValue(fn, args),
-            options,
-            { timeoutMs: 15000, intervalMs: 250 },
-            Boolean,
-            async (_, error) =>
-              error ? `; last error: ${error}` : await pagePreview(),
-            ended.signal,
-            // Give watchInPage's immediate check a head start to avoid a
-            // duplicate Runtime.evaluate at t=0, while still guaranteeing a
-            // host poll runs before short timeouts expire.
-            { delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)) }
-          ),
-          changed,
-        ])) as never;
-      } finally {
-        // Let the watch end before the probe can, or its call reads as a hang.
-        ended.abort();
-        await Promise.race([
-          watching.catch(() => {}),
-          delay(1000, undefined, { ref: false }),
-        ]);
-      }
-    };
-    const settle: Settle = async (options = {}) => {
-      knownOptions("settle", options, SETTLE_OPTIONS);
-      const { quietMs = 300, timeoutMs = 5000 } = options;
-      // Event-driven: parsed DOM + no non-streaming requests in flight for quietMs.
-      return network.waitQuiet(quietMs, timeoutMs, () =>
-        evaluateValue(() => document.readyState !== "loading", []).then(Boolean)
-      );
-    };
-    const goto: Goto = async (url, options = {}) => {
-      knownOptions("goto", options, GOTO_OPTIONS);
-      const wait: GotoWait = options.wait ?? "settle";
-      if (!GOTO_WAITS.has(wait))
-        throw new Error(
-          `goto: unknown wait ${JSON.stringify(wait)}; use "settle", "dom", "load" or "none"`
-        );
-      let settled = false;
-      let loaderId: string | undefined;
-      if (wait === "dom" || wait === "load") {
-        // Subscribe before navigating so fast local/cached pages never race.
-        let onDom: (() => void) | undefined;
-        let onLoad: (() => void) | undefined;
-        const fired = new Promise<boolean>((resolve) => {
-          onLoad = () => resolve(true);
-          client.once(`Page.loadEventFired.${sessionId}`, onLoad);
-          if (wait === "dom") {
-            onDom = () => resolve(true);
-            client.once(`Page.domContentEventFired.${sessionId}`, onDom);
+          const trying = attempt();
+          trying.catch(() => {});
+          try {
+            const value = await Promise.race([
+              trying,
+              delay(remaining, late, { ref: false }),
+            ]);
+            if (value === late) break;
+            if (done(value)) return { found: value };
+            last = value;
+            lastError = undefined;
+          } catch (error) {
+            const failure = error as Error;
+            // A page exception, often a document still loading, is not a
+            // protocol error.
+            if (
+              failure instanceof ReturnedNodeError ||
+              (failure instanceof CdpProtocolError &&
+                !navigated.test(failure.message))
+            )
+              throw failure;
+            lastError = failure;
           }
-        });
-        const cleanupWait = () => {
-          if (onDom)
-            client.off(`Page.domContentEventFired.${sessionId}`, onDom);
-          if (onLoad) client.off(`Page.loadEventFired.${sessionId}`, onLoad);
-        };
+          if (Date.now() >= deadline) break;
+          await delay(intervalMs, undefined, { signal: stopped }).catch(
+            () => {}
+          );
+        }
+        return { last, lastError };
+      };
+      // `until`, for waitFor and click: throws at the deadline, and `explain`
+      // words the last value or page error.
+      const poll = async (
+        name: string,
+        attempt: () => Promise<unknown>,
+        opts: PollOptions<unknown[]>,
+        defaults: { timeoutMs: number; intervalMs: number },
+        done: (value: unknown) => boolean,
+        explain: (
+          last: unknown,
+          lastError?: string
+        ) => Promise<string> | string,
+        stopped?: AbortSignal,
+        initial?: { delayMs?: number; last?: unknown; lastError?: Error }
+      ) => {
+        const timeoutMs = opts.timeoutMs ?? defaults.timeoutMs;
+        const intervalMs = opts.intervalMs ?? defaults.intervalMs;
+        const result = await until(
+          attempt,
+          timeoutMs,
+          intervalMs,
+          done,
+          stopped,
+          initial
+        );
+        if (!result || "found" in result) return result?.found;
+        throw new Error(
+          `${name} timed out after ${timeoutMs}ms on ${await pageUrl()}` +
+            (await explain(
+              result.last,
+              result.lastError?.message.split("\n")[0]
+            ))
+        );
+      };
+      // Settles with the watch expression's first truthy value from the page,
+      // which re-checks on DOM changes and page events, unless the host poll
+      // gets there first. A new document ends a watch, so it is re-installed.
+      const watch = async (
+        expression: string,
+        ended: AbortSignal
+      ): Promise<{ value: unknown } | undefined> => {
+        while (!ended.aborted) {
+          let objectId: string | undefined;
+          const stopWatch = () => {
+            if (objectId)
+              void send("Runtime.callFunctionOn", {
+                objectId,
+                functionDeclaration: String(stopWatchInPage),
+              }).catch(() => {});
+          };
+          try {
+            const handle = await send("Runtime.evaluate", { expression });
+            objectId = handle.result.objectId;
+            if (handle.exceptionDetails || !objectId) break;
+            ended.addEventListener("abort", stopWatch, { once: true });
+            if (ended.aborted) stopWatch();
+            const { result } = await send("Runtime.callFunctionOn", {
+              objectId,
+              functionDeclaration: String(changedInPage),
+              awaitPromise: true,
+              returnByValue: true,
+            });
+            const outcome: WatchResult = result.value;
+            if (outcome && "node" in outcome) throw new ReturnedNodeError();
+            if (outcome) return { value: outcome.value };
+            break;
+          } catch (error) {
+            if (error instanceof ReturnedNodeError) throw error;
+            if (
+              !(error instanceof CdpProtocolError) ||
+              !navigated.test(error.message)
+            )
+              break;
+            await delay(50);
+          } finally {
+            ended.removeEventListener("abort", stopWatch);
+            if (objectId)
+              await send("Runtime.releaseObject", { objectId }).catch(() => {});
+          }
+        }
+        return undefined;
+      };
+      // Answers as the page changes, through watch; the host poll still covers
+      // what no event announces, such as script state or a page with scripts off.
+      const waitFor: WaitFor = async (fn, opts = {}) => {
+        knownOptions("waitFor", opts, POLL_OPTIONS);
+        const args = opts.args ?? ([] as never);
+        const timeoutMs = opts.timeoutMs ?? 15000;
+        const intervalMs = opts.intervalMs ?? 250;
+        const ended = new AbortController();
+        const watching = watch(inPageCall(watchInPage, fn, args), ended.signal);
+        // Without a watch, as on a page with scripts off, the poll alone answers.
+        const changed = watching.then((found) =>
+          found ? found.value : new Promise<never>(() => {})
+        );
+        changed.catch(() => {});
         try {
+          return (await Promise.race([
+            poll(
+              "waitFor",
+              () => evaluateValue(fn, args),
+              opts,
+              { timeoutMs: 15000, intervalMs: 250 },
+              Boolean,
+              async (_, error) =>
+                error ? `; last error: ${error}` : await pagePreview(),
+              ended.signal,
+              { delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)) }
+            ),
+            changed,
+          ])) as never;
+        } finally {
+          ended.abort();
+          await Promise.race([
+            watching.catch(() => {}),
+            delay(1000, undefined, { ref: false }),
+          ]);
+        }
+      };
+      const waitForResponse: WaitForResponse = (match, opts = {}) => {
+        knownOptions("waitForResponse", opts, RESPONSE_OPTIONS);
+        const { timeoutMs = 15000, body: wantBody = true } = opts;
+        const matches = (info: {
+          url: string;
+          status: number;
+          method?: string;
+          mimeType: string;
+        }) =>
+          typeof match === "string"
+            ? info.url.includes(match)
+            : match instanceof RegExp
+              ? match.test(info.url)
+              : Boolean(match(info));
+        const describeMatch = () =>
+          typeof match === "string"
+            ? JSON.stringify(match)
+            : match instanceof RegExp
+              ? String(match)
+              : "matching response";
+
+        return new Promise<CapturedResponse>((resolve, reject) => {
+          const methods = new Map<string, string>();
+          const finished = new Set<string>();
+          const pendingMatch = new Map<
+            string,
+            {
+              url: string;
+              status: number;
+              headers: Record<string, string>;
+              mimeType: string;
+            }
+          >();
+          let done = false;
+
+          const cleanupListeners = () => {
+            clearTimeout(deadline);
+            disposers.delete(onDispose);
+            client.off(`Network.requestWillBeSent.${boundSessionId}`, onReq);
+            client.off(`Network.responseReceived.${boundSessionId}`, onResp);
+            client.off(`Network.loadingFinished.${boundSessionId}`, onFin);
+            client.off(`Network.loadingFailed.${boundSessionId}`, onFail);
+          };
+
+          const finish = (
+            outcome: { ok: CapturedResponse } | { err: Error }
+          ) => {
+            if (done) return;
+            done = true;
+            cleanupListeners();
+            if ("ok" in outcome) resolve(outcome.ok);
+            else reject(outcome.err);
+          };
+
+          const onDispose = () =>
+            finish({ err: new Error("waitForResponse: tab closed") });
+
+          const readAndResolve = async (
+            requestId: string,
+            info: {
+              url: string;
+              status: number;
+              headers: Record<string, string>;
+              mimeType: string;
+            }
+          ) => {
+            if (!wantBody) return finish({ ok: info });
+            try {
+              const raw = await send("Network.getResponseBody", { requestId });
+              const text = raw.base64Encoded
+                ? Buffer.from(raw.body, "base64").toString("utf8")
+                : raw.body;
+              let json: unknown;
+              if (text.trim()) {
+                try {
+                  json = JSON.parse(text);
+                } catch {
+                  // non-JSON body
+                }
+              }
+              finish({
+                ok: {
+                  ...info,
+                  body: text,
+                  ...(json !== undefined ? { json } : {}),
+                },
+              });
+            } catch {
+              // 204/304 or empty response body has no stored resource.
+              finish({ ok: { ...info, body: "" } });
+            }
+          };
+
+          const onReq = ({
+            requestId,
+            request,
+          }: {
+            requestId: string;
+            request: { method: string };
+          }) => {
+            methods.set(requestId, request.method);
+            finished.delete(requestId);
+          };
+
+          const onResp = ({
+            requestId,
+            response,
+          }: {
+            requestId: string;
+            response: {
+              url: string;
+              status: number;
+              headers: Record<string, string>;
+              mimeType: string;
+            };
+          }) => {
+            if (done) return;
+            const method = methods.get(requestId);
+            const info = {
+              url: response.url,
+              status: response.status,
+              headers: response.headers ?? {},
+              mimeType: response.mimeType ?? "",
+            };
+            if (!matches({ ...info, method })) return;
+            if (!wantBody || finished.has(requestId)) {
+              void readAndResolve(requestId, info);
+            } else {
+              pendingMatch.set(requestId, info);
+            }
+          };
+
+          const onFin = ({ requestId }: { requestId: string }) => {
+            if (done) return;
+            finished.add(requestId);
+            const info = pendingMatch.get(requestId);
+            if (info) {
+              pendingMatch.delete(requestId);
+              void readAndResolve(requestId, info);
+            }
+          };
+
+          const onFail = ({
+            requestId,
+            errorText: reason,
+          }: {
+            requestId: string;
+            errorText?: string;
+          }) => {
+            if (done) return;
+            const info = pendingMatch.get(requestId);
+            if (info) {
+              pendingMatch.delete(requestId);
+              finish({
+                err: new Error(
+                  `waitForResponse: ${info.url} failed (${reason || "network error"})`
+                ),
+              });
+            }
+          };
+
+          const deadline = setTimeout(
+            () =>
+              finish({
+                err: new Error(
+                  `waitForResponse timed out after ${timeoutMs}ms waiting for ${describeMatch()}`
+                ),
+              }),
+            timeoutMs
+          );
+          disposers.add(onDispose);
+          client.on(`Network.requestWillBeSent.${boundSessionId}`, onReq);
+          client.on(`Network.responseReceived.${boundSessionId}`, onResp);
+          client.on(`Network.loadingFinished.${boundSessionId}`, onFin);
+          client.on(`Network.loadingFailed.${boundSessionId}`, onFail);
+        });
+      };
+      const settle: Settle = async (opts = {}) => {
+        knownOptions("settle", opts, SETTLE_OPTIONS);
+        const { quietMs = 300, timeoutMs = 5000, maxInFlight = 0 } = opts;
+        return network.waitQuiet(
+          quietMs,
+          timeoutMs,
+          () =>
+            evaluateValue(() => document.readyState !== "loading", []).then(
+              Boolean
+            ),
+          maxInFlight
+        );
+      };
+      const goto: Goto = async (url, opts = {}) => {
+        knownOptions("goto", opts, GOTO_OPTIONS);
+        const wait: GotoWait = opts.wait ?? "settle";
+        if (!GOTO_WAITS.has(wait))
+          throw new Error(
+            `goto: unknown wait ${JSON.stringify(wait)}; use "settle", "dom", "load" or "none"`
+          );
+        let settled = false;
+        let loaderId: string | undefined;
+        if (wait === "dom" || wait === "load") {
+          let onDom: (() => void) | undefined;
+          let onLoad: (() => void) | undefined;
+          const fired = new Promise<boolean>((resolve) => {
+            onLoad = () => resolve(true);
+            client.once(`Page.loadEventFired.${boundSessionId}`, onLoad);
+            if (wait === "dom") {
+              onDom = () => resolve(true);
+              client.once(`Page.domContentEventFired.${boundSessionId}`, onDom);
+            }
+          });
+          const cleanupWait = () => {
+            if (onDom)
+              client.off(`Page.domContentEventFired.${boundSessionId}`, onDom);
+            if (onLoad)
+              client.off(`Page.loadEventFired.${boundSessionId}`, onLoad);
+          };
+          try {
+            const navigation = await send("Page.navigate", { url });
+            if (navigation.errorText)
+              throw new Error(`goto ${url}: ${navigation.errorText}`);
+            loaderId = navigation.loaderId;
+            settled = !loaderId
+              ? true
+              : await Promise.race([
+                  fired,
+                  delay(opts.timeoutMs ?? 15000, false, { ref: false }),
+                ]);
+          } finally {
+            cleanupWait();
+          }
+        } else {
           const navigation = await send("Page.navigate", { url });
           if (navigation.errorText)
             throw new Error(`goto ${url}: ${navigation.errorText}`);
           loaderId = navigation.loaderId;
-          // No loaderId means same-document (hash) navigation: no lifecycle event fires.
-          settled = !loaderId
-            ? true
-            : await Promise.race([
-                fired,
-                delay(options.timeoutMs ?? 15000, false, { ref: false }),
-              ]);
-        } finally {
-          cleanupWait();
+          if (wait === "settle") {
+            const settleOpts: SettleOptions = {};
+            if (opts.quietMs !== undefined) settleOpts.quietMs = opts.quietMs;
+            if (opts.timeoutMs !== undefined)
+              settleOpts.timeoutMs = opts.timeoutMs;
+            if (opts.maxInFlight !== undefined)
+              settleOpts.maxInFlight = opts.maxInFlight;
+            settled = await settle(settleOpts);
+          }
         }
-      } else {
-        const navigation = await send("Page.navigate", { url });
-        if (navigation.errorText)
-          throw new Error(`goto ${url}: ${navigation.errorText}`);
-        loaderId = navigation.loaderId;
-        if (wait === "settle") {
-          const settleOpts: SettleOptions = {};
-          if (options.quietMs !== undefined)
-            settleOpts.quietMs = options.quietMs;
-          if (options.timeoutMs !== undefined)
-            settleOpts.timeoutMs = options.timeoutMs;
-          settled = await settle(settleOpts);
-        }
-      }
-      return {
-        url: await evaluateValue(() => location.href, []).catch(pageUrl),
-        status: network.status(loaderId),
-        settled,
+        return {
+          url: await evaluateValue(() => location.href, []).catch(pageUrl),
+          status: network.status(loaderId),
+          settled,
+        };
       };
-    };
-    const snapshot: Snapshot = async (options = {}) => {
-      knownOptions("snapshot", options, SNAPSHOT_OPTIONS);
-      const { selector = null, maxText = 3000, maxElements = 60 } = options;
-      return (await evaluateOnce(
-        inPageCall(snapshotInPage, selector, maxText, maxElements)
-      )) as PageSnapshot;
-    };
-    const screenshot: Screenshot = async (path, options = {}) => {
-      knownOptions("screenshot", options, ["fullPage"]);
-      const format = SCREENSHOT_FORMATS[extname(path).toLowerCase()];
-      if (!format)
-        throw new Error(
-          `screenshot: ${path} must end in ${Object.keys(SCREENSHOT_FORMATS).join(", ")}`
-        );
-      const clip = options.fullPage
-        ? { ...(await send("Page.getLayoutMetrics")).cssContentSize, scale: 1 }
-        : undefined;
-      const file = resolve(path);
-      const [{ data }] = await Promise.all([
-        send("Page.captureScreenshot", {
-          format,
-          captureBeyondViewport: Boolean(clip),
-          clip,
-        }),
-        mkdir(dirname(file), { recursive: true }),
-      ]);
-      await writeFile(file, Buffer.from(data, "base64"));
-      return file;
-    };
-    const click: Click = async (target, options = {}) => {
-      knownOptions("click", options, POLL_OPTIONS);
-      const [find, args, label] =
-        typeof target === "string"
-          ? [
-              (selector: string) => document.querySelector(selector),
-              [target],
-              target,
-            ]
-          : [target, options.args ?? [], "the element"];
-      const checkPoint = () =>
-        evaluateOnce(
+      const snapshot: Snapshot = async (opts = {}) => {
+        knownOptions("snapshot", opts, SNAPSHOT_OPTIONS);
+        const { selector = null, maxText = 3000, maxElements = 60 } = opts;
+        return (await evaluateOnce(
+          inPageCall(snapshotInPage, selector, maxText, maxElements)
+        )) as PageSnapshot;
+      };
+      const screenshot: Screenshot = async (path, opts = {}) => {
+        knownOptions("screenshot", opts, ["fullPage"]);
+        const format = SCREENSHOT_FORMATS[extname(path).toLowerCase()];
+        if (!format)
+          throw new Error(
+            `screenshot: ${path} must end in ${Object.keys(SCREENSHOT_FORMATS).join(", ")}`
+          );
+        const clip = opts.fullPage
+          ? {
+              ...(await send("Page.getLayoutMetrics")).cssContentSize,
+              scale: 1,
+            }
+          : undefined;
+        const file = resolve(path);
+        const [{ data }] = await Promise.all([
+          send("Page.captureScreenshot", {
+            format,
+            captureBeyondViewport: Boolean(clip),
+            clip,
+          }),
+          mkdir(dirname(file), { recursive: true }),
+        ]);
+        await writeFile(file, Buffer.from(data, "base64"));
+        return file;
+      };
+      const click: Click = async (target, opts = {}) => {
+        knownOptions("click", opts, POLL_OPTIONS);
+        const [find, args, label] =
+          typeof target === "string"
+            ? [
+                (selector: string) => document.querySelector(selector),
+                [target],
+                target,
+              ]
+            : [target, opts.args ?? [], "the element"];
+        const checkPoint = () =>
+          evaluateOnce(
+            inPageCall(
+              clickPointInPage,
+              find as (...args: unknown[]) => unknown,
+              args
+            )
+          );
+        const isPoint = (value: unknown) =>
+          typeof value === "object" && value !== null && "x" in value;
+        let initialLast: unknown;
+        let initialError: Error | undefined;
+        try {
+          const immediate = await checkPoint();
+          if (isPoint(immediate)) {
+            await pressAt(send, immediate as Point);
+            return;
+          }
+          initialLast = immediate;
+        } catch (error) {
+          const failure = error as Error;
+          if (
+            failure instanceof CdpProtocolError &&
+            !navigated.test(failure.message)
+          )
+            throw failure;
+          initialError = failure;
+        }
+        const timeoutMs = opts.timeoutMs ?? 10000;
+        const intervalMs = opts.intervalMs ?? 150;
+        const ended = new AbortController();
+        const watching = watch(
           inPageCall(
+            watchClickInPage,
+            watchInPage,
             clickPointInPage,
             find as (...args: unknown[]) => unknown,
             args
-          )
-        );
-      const isPoint = (value: unknown) =>
-        typeof value === "object" && value !== null && "x" in value;
-      // Fast path: most clicks target an element already rendered on the page.
-      let initialLast: unknown;
-      let initialError: Error | undefined;
-      try {
-        const immediate = await checkPoint();
-        if (isPoint(immediate)) {
-          await pressAt(send, immediate as Point);
-          return;
-        }
-        initialLast = immediate;
-      } catch (error) {
-        const failure = error as Error;
-        if (
-          failure instanceof CdpProtocolError &&
-          !navigated.test(failure.message)
-        )
-          throw failure;
-        initialError = failure;
-      }
-      // Event-driven wait: watch DOM mutations + load events for the element
-      // to appear/uncover, backed by host polling for CSS/script/no-JS changes.
-      const timeoutMs = options.timeoutMs ?? 10000;
-      const intervalMs = options.intervalMs ?? 150;
-      const ended = new AbortController();
-      const watching = watch(
-        inPageCall(
-          watchClickInPage,
-          watchInPage,
-          clickPointInPage,
-          find as (...args: unknown[]) => unknown,
-          args
-        ),
-        ended.signal
-      );
-      const changed = watching.then((found) =>
-        found ? found.value : new Promise<never>(() => {})
-      );
-      changed.catch(() => {});
-      let point: unknown;
-      try {
-        point = await Promise.race([
-          poll(
-            "click",
-            checkPoint,
-            options,
-            { timeoutMs: 10000, intervalMs: 150 },
-            isPoint,
-            (last, error) =>
-              `: ${label} ${(last as { miss?: string } | undefined)?.miss ?? `failed: ${error}`}`,
-            ended.signal,
-            {
-              delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)),
-              last: initialLast,
-              lastError: initialError,
-            }
           ),
-          changed,
-        ]);
+          ended.signal
+        );
+        const changed = watching.then((found) =>
+          found ? found.value : new Promise<never>(() => {})
+        );
+        changed.catch(() => {});
+        let point: unknown;
+        try {
+          point = await Promise.race([
+            poll(
+              "click",
+              checkPoint,
+              opts,
+              { timeoutMs: 10000, intervalMs: 150 },
+              isPoint,
+              async (last, error) => {
+                const miss = (last as { miss?: string } | undefined)?.miss;
+                const hint =
+                  miss === "matched no element"
+                    ? await visibleControlsHint()
+                    : "";
+                return `: ${label} ${miss ?? `failed: ${error}`}${hint}`;
+              },
+              ended.signal,
+              {
+                delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)),
+                last: initialLast,
+                lastError: initialError,
+              }
+            ),
+            changed,
+          ]);
+        } finally {
+          ended.abort();
+          await Promise.race([
+            watching.catch(() => {}),
+            delay(1000, undefined, { ref: false }),
+          ]);
+        }
+        await pressAt(send, point as Point);
+      };
+      const fill: Fill = async (target, value, opts = {}) => {
+        knownOptions("fill", opts, FILL_OPTIONS);
+        const { fast, clear = true, ...pollOpts } = opts;
+        await click(target, pollOpts);
+        if (clear) {
+          await press(send, "Meta+a");
+          await press(send, "Backspace");
+        }
+        if (value) await type(send, value, fast ? { fast } : undefined);
+      };
+      const page: PageContext = {
+        send,
+        sessionId: boundSessionId,
+        targetId: boundTargetId,
+        evaluate,
+        goto,
+        settle,
+        waitFor,
+        waitForResponse,
+        snapshot,
+        screenshot,
+        click,
+        fill,
+        type: (text, typeOptions) => {
+          if (typeOptions) knownOptions("type", typeOptions, TYPE_OPTIONS);
+          return type(send, text, typeOptions);
+        },
+        press: (key) => press(send, key),
+        clickRecaptchaCheckbox: () =>
+          clickRecaptchaCheckbox({ send, evaluate }),
+        clickTurnstileCheckbox: () =>
+          clickTurnstileCheckbox({ send, evaluate }),
+        holdPressAndHoldButton: () => holdPressAndHoldButton({ send }),
+      };
+      const dispose = () => {
+        for (const fn of [...disposers]) fn();
+        network.dispose();
+        if (!isPersonal)
+          client.off(
+            `Page.javascriptDialogOpening.${boundSessionId}`,
+            onDialog
+          );
+      };
+      return { page, dispose };
+    };
+
+    const main = await bindPage(targetId, sessionId, Boolean(personal));
+    const withTab: WithTab = async (fn) => {
+      if (personal)
+        throw new Error(
+          "withTab is unavailable in --personal sessions (chrome.debugger reaches only one tab)"
+        );
+      const { targetId: childTargetId } = await client.Target.createTarget({
+        url: "about:blank",
+        background: true,
+      });
+      let childSessionId: string | undefined;
+      let disposeChild: (() => void) | undefined;
+      try {
+        ({ sessionId: childSessionId } = await client.Target.attachToTarget({
+          targetId: childTargetId,
+          flatten: true,
+        }));
+        const bound = await bindPage(childTargetId, childSessionId, false);
+        disposeChild = bound.dispose;
+        return await fn(bound.page);
       } finally {
-        ended.abort();
-        await Promise.race([
-          watching.catch(() => {}),
-          delay(1000, undefined, { ref: false }),
-        ]);
+        disposeChild?.();
+        if (childSessionId)
+          await client.Target.detachFromTarget({
+            sessionId: childSessionId,
+          }).catch(() => {});
+        await client.Target.closeTarget({ targetId: childTargetId }).catch(
+          () => {}
+        );
       }
-      await pressAt(send, point as Point);
     };
     const context: ProbeContext = {
       cdp: client,
-      send,
-      sessionId,
-      targetId,
-      evaluate,
-      goto,
-      settle,
-      waitFor,
-      snapshot,
-      screenshot,
-      click,
-      type: (text, typeOptions) => {
-        if (typeOptions) knownOptions("type", typeOptions, TYPE_OPTIONS);
-        return type(send, text, typeOptions);
-      },
-      press: (key) => press(send, key),
-      clickRecaptchaCheckbox: () => clickRecaptchaCheckbox({ send, evaluate }),
-      clickTurnstileCheckbox: () => clickTurnstileCheckbox({ send, evaluate }),
-      holdPressAndHoldButton: () => holdPressAndHoldButton({ send }),
+      ...main.page,
+      withTab,
     };
     let run: Probe<T>;
     if (typeof snippet === "string") {
@@ -1338,6 +1687,7 @@ export async function runProbe<T = unknown>(
     try {
       return (await run(context)) as T;
     } finally {
+      main.dispose();
       if (!personal)
         await client.Target.detachFromTarget({ sessionId }).catch(() => {});
     }

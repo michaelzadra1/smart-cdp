@@ -166,7 +166,10 @@ function keepHidden(pid: number) {
  * Starts a hidden second instance of the app on a fresh copy of its profile,
  * with CDP on loopback. stopChrome closes it and removes the copy.
  */
-export async function launchApp(app: ElectronApp): Promise<Chrome> {
+export async function launchApp(
+  app: ElectronApp,
+  options?: { keepSocket?: boolean }
+): Promise<Chrome> {
   const profile = await mkdtemp(join(tmpdir(), "smart-cdp-app-"));
   try {
     await copyProfile(app.dataDir, profile);
@@ -178,6 +181,7 @@ export async function launchApp(app: ElectronApp): Promise<Chrome> {
     name: app.name,
     binary: app.executable,
     profile,
+    keepSocket: options?.keepSocket,
     onSpawn: keepHidden,
   });
 }

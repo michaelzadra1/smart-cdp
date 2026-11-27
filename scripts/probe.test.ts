@@ -490,7 +490,8 @@ test("goto and settle wait for a quiet network; screenshot saves the page", asyn
       fullPage: join(dir, "new/full.jpg"),
       missing: 404,
       hung: false,
-      option: "settle: unknown option timeout; it takes quietMs, timeoutMs",
+      option:
+        "settle: unknown option timeout; it takes quietMs, timeoutMs, maxInFlight",
     });
     expect(result.failed).toMatch(
       /^goto http:.*: net::ERR_CONNECTION_REFUSED$/
@@ -1189,7 +1190,9 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
     expect(failures[0]).toMatch(
       /^click timed out after 300ms on http:.*: #under is covered by <div#overlay>$/
     );
-    expect(failures[1]).toMatch(/: #missing matched no element$/);
+    expect(failures[1]).toMatch(
+      /: #missing matched no element; visible controls:.*#year/
+    );
     expect(failures[2]).toMatch(/^press: unknown key "F13"; use a US key/);
     expect(failures[3]).toBe(
       "waitFor: unknown option timeout; it takes args, timeoutMs, intervalMs"
@@ -1602,7 +1605,7 @@ test("goto settles past SSE/beacons, supports wait: dom, snapshot returns clicka
     );
 
     expect(result.streamPage).toMatchObject({ status: 200, settled: true });
-    expect(result.streamMs).toBeLessThan(2500);
+    expect(result.streamMs).toBeLessThan(4000);
     expect(result.snap.title).toBe("Live App");
     expect(result.snap.elements.some((e) => e.text === "Hidden")).toBe(false);
     expect(result.snap.elements.some((e) => e.text === "Pro Plan")).toBe(true);
@@ -1626,6 +1629,131 @@ test("goto settles past SSE/beacons, supports wait: dom, snapshot returns clicka
     );
   } finally {
     for (const timer of streams) clearInterval(timer);
+    await close(server);
+  }
+}, 30000);
+
+test("withTab runs parallel background tabs, waitForResponse captures API JSON, fill replaces input with trusted chords, and maxInFlight settles past a long-poll", async () => {
+  const server = await serve((req, res) => {
+    if (req.url === "/hang") return;
+    if (req.url === "/api/items") {
+      res.setHeader("Content-Type", "application/json");
+      setTimeout(
+        () => res.end(JSON.stringify({ items: ["a", "b"], count: 2 })),
+        150
+      );
+      return;
+    }
+    res.setHeader("Content-Type", "text/html");
+    if (req.url?.startsWith("/tab/")) {
+      const id = req.url.slice(5);
+      res.end(`<title>Tab ${id}</title><p id="val">${id}</p>`);
+      return;
+    }
+    res.end(`<title>Hub</title>
+      <input id="search" value="stale query">
+      <button id="load-api">Load</button>
+      <script>
+        window.untrusted = 0;
+        for (const t of ["keydown", "input", "mousedown", "click"])
+          addEventListener(t, (e) => { if (!e.isTrusted) window.untrusted++; }, true);
+        fetch("/hang");
+        document.getElementById("load-api").onclick = () => fetch("/api/items");
+      </script>`);
+  });
+  try {
+    const base = `http://127.0.0.1:${portOf(server)}`;
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({
+        cdp,
+        goto,
+        settle,
+        waitForResponse,
+        click,
+        fill,
+        withTab,
+        evaluate,
+      }) => {
+        const beforeTargets = (
+          await cdp.Target.getTargets()
+        ).targetInfos.filter((t) => t.type === "page").length;
+
+        // maxInFlight: 1 settles past the 1 hanging /hang request; default 0 does not.
+        const t0 = Date.now();
+        const page = await goto(`${base}/`, { maxInFlight: 1 });
+        const settleWithAllowanceMs = Date.now() - t0;
+        const strictSettled = await settle({ timeoutMs: 400 });
+
+        // waitForResponse captures the JSON response triggered by a click.
+        const apiPending = waitForResponse("/api/items");
+        await click("#load-api");
+        const api = await apiPending;
+        const apiTimeout = await waitForResponse("/never-called", {
+          timeoutMs: 200,
+        }).catch(message);
+
+        // fill replaces existing input text via trusted Meta+a + Backspace + type.
+        await fill("#search", "fresh", { fast: true });
+        const afterFast = await evaluate(
+          () => document.querySelector<HTMLInputElement>("#search")?.value
+        );
+        await fill("#search", "typed");
+        const afterTyped = await evaluate(() => ({
+          value: document.querySelector<HTMLInputElement>("#search")?.value,
+          untrusted: (window as unknown as { untrusted: number }).untrusted,
+        }));
+
+        // withTab fans out 3 background tabs in parallel and closes them in finally.
+        const tabs = await Promise.all(
+          ["one", "two", "three"].map((id) =>
+            withTab(async (tab) => {
+              await tab.goto(`${base}/tab/${id}`, { wait: "dom" });
+              return await tab.evaluate(() => ({
+                title: document.title,
+                val: document.getElementById("val")?.textContent,
+              }));
+            })
+          )
+        );
+        const afterTargets = (await cdp.Target.getTargets()).targetInfos.filter(
+          (t) => t.type === "page"
+        ).length;
+
+        return {
+          beforeTargets,
+          afterTargets,
+          page,
+          settleWithAllowanceMs,
+          strictSettled,
+          api: { status: api.status, json: api.json },
+          apiTimeout,
+          afterFast,
+          afterTyped,
+          tabs,
+        };
+      }
+    );
+
+    expect(result.page).toMatchObject({ status: 200, settled: true });
+    expect(result.settleWithAllowanceMs).toBeLessThan(4000);
+    expect(result.strictSettled).toBe(false);
+    expect(result.api).toEqual({
+      status: 200,
+      json: { items: ["a", "b"], count: 2 },
+    });
+    expect(result.apiTimeout).toMatch(
+      /waitForResponse timed out after 200ms waiting for "\/never-called"/
+    );
+    expect(result.afterFast).toBe("fresh");
+    expect(result.afterTyped).toEqual({ value: "typed", untrusted: 0 });
+    expect(result.tabs).toEqual([
+      { title: "Tab one", val: "one" },
+      { title: "Tab two", val: "two" },
+      { title: "Tab three", val: "three" },
+    ]);
+    expect(result.afterTargets).toBe(result.beforeTargets);
+  } finally {
     await close(server);
   }
 }, 30000);

@@ -43,6 +43,7 @@ export async function trackNetwork(
   const inFlight = new Set<string>();
   const documentStatus = new Map<string, number>();
   const waiters = new Set<() => void>();
+  const disposers = new Set<() => void>();
   let lastActivity = Date.now();
   let domReady = false;
 
@@ -56,43 +57,62 @@ export async function trackNetwork(
     notify();
   };
 
-  cdp.on(`Network.requestWillBeSent.${sessionId}`, ({ requestId, type }) => {
+  const onRequest = ({
+    requestId,
+    type,
+  }: {
+    requestId: string;
+    type?: string;
+  }) => {
     if (type && IGNORED_TYPES.has(type)) return;
     inFlight.add(requestId);
     lastActivity = Date.now();
     notify();
-  });
+  };
 
-  cdp.on(
-    `Network.responseReceived.${sessionId}`,
-    ({ requestId, type, response }) => {
-      if (type === "Document") documentStatus.set(requestId, response.status);
-      // fetch()-based SSE streams start as type "Fetch" and only announce
-      // text/event-stream when headers arrive.
-      if ((type && IGNORED_TYPES.has(type)) || isEventStream(response)) {
-        if (inFlight.delete(requestId)) {
-          lastActivity = Date.now();
-          notify();
-        }
+  const onResponse = ({
+    requestId,
+    type,
+    response,
+  }: {
+    requestId: string;
+    type?: string;
+    response: {
+      status: number;
+      mimeType?: string;
+      headers?: Record<string, string>;
+    };
+  }) => {
+    if (type === "Document") documentStatus.set(requestId, response.status);
+    // fetch()-based SSE streams start as type "Fetch" and only announce
+    // text/event-stream when headers arrive.
+    if ((type && IGNORED_TYPES.has(type)) || isEventStream(response)) {
+      if (inFlight.delete(requestId)) {
+        lastActivity = Date.now();
+        notify();
       }
     }
-  );
+  };
 
   // Chrome reports no end for the requests a replaced document left
   // unfinished, so a new main document resets the count and waits for its DOM.
-  cdp.on(`Page.frameNavigated.${sessionId}`, ({ frame }) => {
+  const onNavigated = ({ frame }: { frame: { parentId?: string } }) => {
     if (!frame.parentId) {
       inFlight.clear();
       domReady = false;
       lastActivity = Date.now();
       notify();
     }
-  });
+  };
 
   const markDomReady = () => {
     domReady = true;
     notify();
   };
+
+  cdp.on(`Network.requestWillBeSent.${sessionId}`, onRequest);
+  cdp.on(`Network.responseReceived.${sessionId}`, onResponse);
+  cdp.on(`Page.frameNavigated.${sessionId}`, onNavigated);
   cdp.on(`Page.domContentEventFired.${sessionId}`, markDomReady);
   cdp.on(`Page.loadEventFired.${sessionId}`, markDomReady);
   cdp.on(`Network.loadingFinished.${sessionId}`, ended);
@@ -102,15 +122,16 @@ export async function trackNetwork(
 
   return {
     /**
-     * Event-driven wait until the document is parsed and no tracked request
-     * has been in flight for `quietMs` (counted from the call's start at the
-     * earliest, so a request an action triggers moments later is still caught).
-     * Resolves `false` on `timeoutMs`.
+     * Event-driven wait until the document is parsed and at most `maxInFlight`
+     * tracked requests remain open for `quietMs` (counted from the call's start
+     * at the earliest, so a request an action triggers moments later is still
+     * caught). Resolves `false` on `timeoutMs`.
      */
     waitQuiet: (
       quietMs: number,
       timeoutMs: number,
-      checkDomReady: () => Promise<boolean>
+      checkDomReady: () => Promise<boolean>,
+      maxInFlight = 0
     ): Promise<boolean> =>
       new Promise((resolve) => {
         const began = Date.now();
@@ -126,19 +147,22 @@ export async function trackNetwork(
           clearTimeout(recheckTimer);
           clearTimeout(deadlineTimer);
           waiters.delete(schedule);
+          disposers.delete(cancel);
           resolve(settled);
         };
+
+        const cancel = () => finish(false);
 
         const schedule = () => {
           if (done) return;
           clearTimeout(quietTimer);
           quietTimer = undefined;
-          if (inFlight.size > 0) return;
+          if (inFlight.size > maxInFlight) return;
           const elapsed = Date.now() - Math.max(lastActivity, began);
           const wait = Math.max(0, quietMs - elapsed);
           quietTimer = setTimeout(() => {
             quietTimer = undefined;
-            if (done || inFlight.size > 0) return;
+            if (done || inFlight.size > maxInFlight) return;
             if (domReady) return finish(true);
             if (checkingDom) return;
             checkingDom = true;
@@ -148,7 +172,7 @@ export async function trackNetwork(
                 if (done) return;
                 if (ready) {
                   domReady = true;
-                  if (inFlight.size === 0) finish(true);
+                  if (inFlight.size <= maxInFlight) finish(true);
                 } else {
                   // Still parsing: domContentEventFired wakes schedule();
                   // this fallback covers a probe that disabled Page events.
@@ -168,10 +192,22 @@ export async function trackNetwork(
 
         const deadlineTimer = setTimeout(() => finish(false), timeoutMs);
         waiters.add(schedule);
+        disposers.add(cancel);
         schedule();
       }),
     /** The HTTP status of the document a navigation loaded, by its loaderId. */
     status: (loaderId: string | undefined) =>
       loaderId === undefined ? undefined : documentStatus.get(loaderId),
+    /** Removes all CDP listeners and cancels pending waiters (for child tabs). */
+    dispose: () => {
+      for (const cancel of [...disposers]) cancel();
+      cdp.off(`Network.requestWillBeSent.${sessionId}`, onRequest);
+      cdp.off(`Network.responseReceived.${sessionId}`, onResponse);
+      cdp.off(`Page.frameNavigated.${sessionId}`, onNavigated);
+      cdp.off(`Page.domContentEventFired.${sessionId}`, markDomReady);
+      cdp.off(`Page.loadEventFired.${sessionId}`, markDomReady);
+      cdp.off(`Network.loadingFinished.${sessionId}`, ended);
+      cdp.off(`Network.loadingFailed.${sessionId}`, ended);
+    },
   };
 }
