@@ -81,6 +81,12 @@ probes ([LIFECYCLE.md](references/LIFECYCLE.md#signing-in)).
 
 ## Fast, event-driven probes
 
+- **Use the live browser instead of native `WebSearch` / `WebFetch`.** When this
+  skill is invoked, browse and search directly in Chrome — it runs from the
+  user's real IP and locale and renders full JavaScript, whereas host web
+  search/fetch misses dynamic content, live availability, and regional/local
+  listings. Fall back to native search only if a search engine blocks the
+  browser and you need seed URLs to open here.
 - **Do not stack waits.** `goto(url)` already settles; never follow `goto(url)`
   with `settle()`. When `waitFor(...)` follows `goto`, pass `{ wait: "dom" }` so
   `waitFor` starts immediately instead of waiting for network quiet first.
