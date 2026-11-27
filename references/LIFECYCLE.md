@@ -146,12 +146,13 @@ Probes connect to the host one at a time. The host addresses the tab as
 session `smart-cdp-tab`: `send`, `sessionId` and `cdp.on("<event>.<sessionId>")`
 work as they do on a launched browser. After each probe the extension detaches
 and reattaches, which clears every domain and `Fetch` pattern the probe
-enabled. Each attach adds an empty virtual WebAuthn authenticator, so the
-profile's passkeys never open Chrome's Touch ID sheet over the page. While the
-tab is attached, Chrome shows its "started debugging this browser" bar.
-Release, the idle timeout, the tab closing or Chrome quitting end the host.
-Release and idle close the tab; the profile and every other tab stay as they
-were.
+enabled; a probe connecting during that brief reset queues its commands until
+the reattach completes rather than failing busy. Each attach adds an empty
+virtual WebAuthn authenticator, so the profile's passkeys never open Chrome's
+Touch ID sheet over the page. While the tab is attached, Chrome shows its
+"started debugging this browser" bar. Release, the idle timeout, the tab
+closing or Chrome quitting end the host. Release and idle close the tab; the
+profile and every other tab stay as they were.
 
 Limits:
 - `chrome.debugger` reaches only that tab and its child sessions. `Browser.*`,

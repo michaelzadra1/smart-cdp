@@ -51,11 +51,13 @@ const tabPath = `/smart-cdp/${randomUUID()}`;
 const probePath = `/${randomUUID()}`;
 const pending = new Map<number, Request>();
 const attached = Promise.withResolvers<string | undefined>();
+const extensionClosed = Promise.withResolvers<void>();
 let server: Server<Data> | undefined;
 let extension: Socket | undefined;
 let client: Socket | undefined;
+let queued: string[] = [];
 let ready = false;
-let busy = true;
+let tabReady = false;
 let idle: ReturnType<typeof setTimeout> | undefined;
 let stopping: Promise<never> | undefined;
 let nextId = 1;
@@ -87,14 +89,22 @@ const call = (method: string, params: Record<string, unknown> = {}) =>
     toExtension({ method, params }, { resolve })
   );
 
+const forwardFromClient = (socket: Socket, raw: string) => {
+  const { id, ...command } = JSON.parse(raw) as Message;
+  if (command.sessionId === ROOT_SESSION) delete command.sessionId;
+  toExtension(command, { client: socket, id });
+};
+
 // The profile's own passkeys open Chrome's passkey sheet (Touch ID), which
 // nothing in the page can close. An empty virtual authenticator answers the
 // tab's passkey requests instead, so they fail at once, as on a device with no
 // passkey, and the site offers another way in. Reattaching drops it.
 async function prepareTab() {
   // Lets the host answer "Leave site?": it blocks navigation and closing the tab.
-  await call("Page.enable");
-  await call("WebAuthn.enable", { enableUI: false });
+  await Promise.all([
+    call("Page.enable"),
+    call("WebAuthn.enable", { enableUI: false }),
+  ]);
   await call("WebAuthn.addVirtualAuthenticator", {
     options: {
       protocol: "ctap2",
@@ -115,10 +125,10 @@ const shutdown = (error?: unknown) => {
     const tab = extension;
     if (tab && tab.readyState === WebSocket.OPEN) {
       tab.send(JSON.stringify({ type: "close" }));
-      for (let waited = 0; tab.readyState === WebSocket.OPEN; waited += 50) {
-        if (waited >= 2000) break;
-        await delay(50);
-      }
+      await Promise.race([
+        extensionClosed.promise,
+        delay(2000, undefined, { ref: false }),
+      ]);
     }
     if (error && process.send && process.connected) {
       const { message, code, syscall } = error as NodeJS.ErrnoException;
@@ -154,10 +164,15 @@ async function fromExtension(socket: Socket, message: Message, key: string) {
   }
   if (message.type === "ready") {
     await prepareTab();
-    busy = false;
+    tabReady = true;
     if (!ready) {
       ready = true;
       attached.resolve(message.targetId);
+    }
+    // Flush commands from a probe that connected while the tab was resetting.
+    if (client?.readyState === WebSocket.OPEN && queued.length) {
+      for (const raw of queued) forwardFromClient(client, raw);
+      queued = [];
     }
     return armIdle();
   }
@@ -181,7 +196,7 @@ async function fromExtension(socket: Socket, message: Message, key: string) {
     dialog?.type === "beforeunload"
   )
     void call("Page.handleJavaScriptDialog", { accept: true });
-  if (client?.readyState === WebSocket.OPEN)
+  if (client?.readyState === WebSocket.OPEN && tabReady)
     client.send(
       JSON.stringify({
         ...message,
@@ -204,7 +219,10 @@ try {
       const { pathname } = new URL(request.url);
       if (pathname === tabPath) return new Response("");
       if (pathname === `${probePath}/status`) {
-        const status: RelayStatus = { busy, closing: Boolean(stopping) };
+        const status: RelayStatus = {
+          busy: Boolean(client) || !ready,
+          closing: Boolean(stopping),
+        };
         return Response.json(status);
       }
       if (stopping) return new Response("Closing", { status: 503 });
@@ -220,10 +238,11 @@ try {
       if (role === "extension" && extension)
         return new Response("Tab taken", { status: 409 });
       // One tab, one driver: concurrent probes race on navigation and input.
-      if (role === "probe" && (busy || client))
+      // A probe arriving during the brief reset between probes is accepted and
+      // its commands are queued until the extension finishes reattaching.
+      if (role === "probe" && (client || !ready))
         return new Response("Session busy", { status: 409 });
       if (bun.upgrade(request, { data: { role } })) {
-        if (role === "probe") busy = true;
         return;
       }
       return new Response("Expected a WebSocket upgrade", { status: 426 });
@@ -238,28 +257,31 @@ try {
         if (role === "extension") extension = socket;
         else {
           client = socket;
+          queued = [];
           clearTimeout(idle);
         }
       },
       message(socket, raw) {
-        const message = JSON.parse(String(raw)) as Message;
+        const text = String(raw);
         if (socket === extension)
-          return void fromExtension(socket, message, key);
+          return void fromExtension(socket, JSON.parse(text) as Message, key);
         if (socket !== client) return;
-        const { id, ...command } = message;
-        if (command.sessionId === ROOT_SESSION) delete command.sessionId;
-        toExtension(command, { client: socket, id });
+        if (tabReady) forwardFromClient(socket, text);
+        else queued.push(text);
       },
       close(socket) {
         if (socket === extension) {
           extension = undefined;
+          extensionClosed.resolve();
           return void shutdown(
             ready ? undefined : new Error("The extension closed the connection")
           );
         }
         if (socket !== client) return;
         client = undefined;
-        // Busy until the extension has reattached and the tab is clean.
+        queued = [];
+        tabReady = false;
+        // Extension detaches and reattaches to clear domains enabled by the probe.
         extension?.send(JSON.stringify({ type: "reset" }));
       },
     },

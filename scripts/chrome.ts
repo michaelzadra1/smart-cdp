@@ -286,7 +286,7 @@ export async function launchBrowser({
       try {
         chrome.endpoint = await browserEndpoint(port);
       } catch {
-        await delay(50);
+        await delay(20);
       }
     }
     // The reserved port was briefly free: prove the endpoint is our child.

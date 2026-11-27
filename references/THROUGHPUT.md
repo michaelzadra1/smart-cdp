@@ -436,8 +436,9 @@ every item of a run.
   tool.
 - `load` may never fire on pages with slow third-party content (130 of 132
   waits ran out a 12 s timeout). Wait for the response or DOM state the next
-  step needs. `goto` and `settle` add at least 500 ms per call, so in a bulk
-  run navigate with `send("Page.navigate")` and a `waitFor`.
+  step needs. Default `goto` and `settle` add at least 300 ms of quiet time per
+  call, so in a bulk run use `goto(url, { wait: "dom" })` or
+  `send("Page.navigate")` with a `waitFor`.
 - When a required interaction makes the app fire its own requests, cancel them
   rather than letting them run. One click fired 289 background requests, 268 of
   them refused, and burned the session.

@@ -269,17 +269,19 @@ upstream.addEventListener(
       let targetId: string | undefined;
       if (config.app) targetId = await appWindow();
       else if (chrome) {
-        await call({
-          method: "Browser.setDownloadBehavior",
-          params: profileDownloads(chrome),
-        });
         // The session's tab: every probe in the session continues on it.
-        const { result, error } = await call({
-          method: "Target.createTarget",
-          params: { url: "about:blank", background: true },
-        });
-        if (error) throw new Error(error.message);
-        targetId = result?.targetId;
+        const [, created] = await Promise.all([
+          call({
+            method: "Browser.setDownloadBehavior",
+            params: profileDownloads(chrome),
+          }),
+          call({
+            method: "Target.createTarget",
+            params: { url: "about:blank", background: true },
+          }),
+        ]);
+        if (created.error) throw new Error(created.error.message);
+        targetId = created.result?.targetId;
       }
       server = Bun.serve<Client>({
         hostname: "127.0.0.1",

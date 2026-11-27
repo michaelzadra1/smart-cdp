@@ -213,7 +213,7 @@ export async function holdPressAndHoldButton({
   if (state !== "failed") {
     const deadline = Date.now() + SETTLE_MS;
     while (!cleared && Date.now() < deadline) {
-      await delay(600);
+      await delay(200);
       cleared =
         (await pageUrl(send)) !== startUrl ||
         (await challengeState(send)) === "gone";

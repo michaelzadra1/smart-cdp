@@ -31,12 +31,13 @@ export type WatchResult = { node: true } | { value: unknown } | null;
 
 /**
  * In page: watches for `fn` to return a truthy value, checking it now and
- * again on every DOM mutation, on each hashchange, popstate and
- * readystatechange, and on any load or error event (images included, caught
- * in the capture phase). No timer: it answers as the page changes. The host
- * holds the returned object by reference rather than a page global, awaits
- * `changed` through changedInPage and ends the watch with stopWatchInPage.
- * Callbacks never run in a page with scripts disabled.
+ * again on DOM mutations, hashchange, popstate, readystatechange, and load or
+ * error events (images included, caught in the capture phase). Rapid DOM
+ * mutation storms are coalesced (immediate first check, then at most every
+ * 50ms) so heavy SPA hydration never thrashes layout when `fn` reads innerText.
+ * The host holds the returned object by reference rather than a page global,
+ * awaits `changed` through changedInPage and ends the watch with
+ * stopWatchInPage. Callbacks never run in a page with scripts disabled.
  */
 export function watchInPage<A extends unknown[]>(
   fn: (...args: A) => unknown,
@@ -46,23 +47,57 @@ export function watchInPage<A extends unknown[]>(
   const changed = new Promise<WatchResult>((resolve) => {
     const events = ["hashchange", "popstate", "load", "error"];
     let done = false;
-    const check = async () => {
+    let running = false;
+    let dirty = false;
+    let lastRun = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    function finish(result: WatchResult) {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      observer.disconnect();
+      for (const type of events) removeEventListener(type, schedule, true);
+      document.removeEventListener("readystatechange", schedule);
+      resolve(result);
+    }
+
+    const run = async () => {
+      if (done) return;
+      running = true;
+      dirty = false;
+      lastRun = performance.now();
       try {
         const value = await fn(...args);
         if (value) finish(value instanceof Node ? { node: true } : { value });
       } catch {
         // A document still loading can throw; the next change checks again.
+      } finally {
+        running = false;
+        if (!done && dirty) schedule();
       }
     };
-    const observer = new MutationObserver(() => void check());
-    function finish(result: WatchResult) {
+
+    const schedule = () => {
       if (done) return;
-      done = true;
-      observer.disconnect();
-      for (const type of events) removeEventListener(type, check, true);
-      document.removeEventListener("readystatechange", check);
-      resolve(result);
-    }
+      if (running) {
+        dirty = true;
+        return;
+      }
+      const gap = performance.now() - lastRun;
+      if (gap >= 50) {
+        clearTimeout(timer);
+        timer = undefined;
+        void run();
+      } else if (timer === undefined) {
+        timer = setTimeout(() => {
+          timer = undefined;
+          void run();
+        }, 50 - gap);
+      }
+    };
+
+    const observer = new MutationObserver(schedule);
     stop = () => finish(null);
     observer.observe(document, {
       subtree: true,
@@ -70,9 +105,9 @@ export function watchInPage<A extends unknown[]>(
       attributes: true,
       characterData: true,
     });
-    for (const type of events) addEventListener(type, check, true);
-    document.addEventListener("readystatechange", check);
-    void check();
+    for (const type of events) addEventListener(type, schedule, true);
+    document.addEventListener("readystatechange", schedule);
+    void run();
   });
   return { changed, stop: () => stop() };
 }
@@ -85,4 +120,265 @@ export function changedInPage(this: { changed: Promise<WatchResult> }) {
 /** In page, on watchInPage's object: ends the watch, settling it with null. */
 export function stopWatchInPage(this: { stop: () => void }) {
   this.stop();
+}
+
+/** Compact visible interactive element reported by snapshot(). */
+export type SnapshotElement = {
+  tag: string;
+  selector: string;
+  role?: string;
+  type?: string;
+  text?: string;
+  placeholder?: string;
+  value?: string;
+  checked?: boolean;
+  href?: string;
+  disabled?: boolean;
+};
+
+/** Compact page overview returned by snapshot(). */
+export type PageSnapshot = {
+  url: string;
+  title: string;
+  text: string;
+  elements: SnapshotElement[];
+  truncated?: { text?: boolean; elements?: number };
+};
+
+/**
+ * In page: returns a compact, token-efficient summary of the page (or a scoped
+ * container): normalized visible text plus visible interactive controls with
+ * verified unique CSS selectors ready for click().
+ */
+export function snapshotInPage(
+  rootSelector: string | null,
+  maxText: number,
+  maxElements: number
+): PageSnapshot {
+  const root = rootSelector
+    ? document.querySelector(rootSelector)
+    : document.body;
+  const rawText = (
+    (root as HTMLElement | null)?.textContent ??
+    document.body?.textContent ??
+    ""
+  )
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const textTruncated = rawText.length > maxText;
+  const text = textTruncated ? rawText.slice(0, maxText) : rawText;
+
+  const isUnique = (selector: string, el: Element) => {
+    try {
+      const list = document.querySelectorAll(selector);
+      return list.length === 1 && list[0] === el;
+    } catch {
+      return false;
+    }
+  };
+
+  const uniqueSelector = (el: Element): string => {
+    if (el.id) {
+      const idSel = `#${CSS.escape(el.id)}`;
+      if (isUnique(idSel, el)) return idSel;
+    }
+    const tag = el.tagName.toLowerCase();
+    for (const attr of [
+      "data-testid",
+      "data-test",
+      "data-cy",
+      "name",
+      "aria-label",
+      "placeholder",
+    ]) {
+      const val = el.getAttribute(attr);
+      if (!val || val.length > 80) continue;
+      const escaped = val.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const sel = `${tag}[${attr}="${escaped}"]`;
+      if (isUnique(sel, el)) return sel;
+    }
+    if (tag === "a") {
+      const href = el.getAttribute("href");
+      if (href && href.length <= 80 && !href.startsWith("javascript:")) {
+        const escaped = href.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const sel = `a[href="${escaped}"]`;
+        if (isUnique(sel, el)) return sel;
+      }
+    }
+    if (tag === "label") {
+      const forId = el.getAttribute("for");
+      if (forId) {
+        const escaped = forId.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const sel = `label[for="${escaped}"]`;
+        if (isUnique(sel, el)) return sel;
+      }
+    }
+    const parts: string[] = [];
+    let cur: Element | null = el;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      if (cur.id) {
+        const idSel = `#${CSS.escape(cur.id)}`;
+        const candidate = [idSel, ...parts].join(" > ");
+        if (isUnique(candidate, el)) return candidate;
+      }
+      const curTag = cur.tagName.toLowerCase();
+      let idx = 1;
+      let sib = cur.previousElementSibling;
+      while (sib) {
+        if (sib.tagName === cur.tagName) idx++;
+        sib = sib.previousElementSibling;
+      }
+      const hasSameTagSib =
+        idx > 1 ||
+        (() => {
+          let next = cur.nextElementSibling;
+          while (next) {
+            if (next.tagName === cur.tagName) return true;
+            next = next.nextElementSibling;
+          }
+          return false;
+        })();
+      parts.unshift(hasSameTagSib ? `${curTag}:nth-of-type(${idx})` : curTag);
+      const candidate = parts.join(" > ");
+      if (isUnique(candidate, el)) return candidate;
+      cur = cur.parentElement;
+    }
+    return parts.join(" > ") || tag;
+  };
+
+  const isVisible = (el: Element) => {
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    const style = getComputedStyle(el);
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0"
+    );
+  };
+
+  const interactiveQuery = [
+    "a[href]",
+    "button",
+    "input:not([type='hidden'])",
+    "select",
+    "textarea",
+    "[role='button']",
+    "[role='link']",
+    "[role='tab']",
+    "[role='menuitem']",
+    "[role='option']",
+    "[role='checkbox']",
+    "[role='radio']",
+    "[role='combobox']",
+    "[role='textbox']",
+    "[role='switch']",
+    "[contenteditable='true']",
+    "label[for]",
+  ].join(",");
+
+  const scope = root ?? document;
+  const candidates = scope.querySelectorAll(interactiveQuery);
+  const elements: SnapshotElement[] = [];
+  let extraElements = 0;
+
+  for (const el of candidates) {
+    const tag = el.tagName.toLowerCase();
+    // Skip labels whose target input is itself visible (avoid duplicate entries);
+    // keep labels that front hidden styled radios/checkboxes so click() works.
+    if (tag === "label") {
+      const forId = el.getAttribute("for");
+      const target = forId ? document.getElementById(forId) : null;
+      if (!target || isVisible(target)) continue;
+    }
+    if (!isVisible(el)) continue;
+    if (elements.length >= maxElements) {
+      extraElements++;
+      continue;
+    }
+
+    const entry: SnapshotElement = {
+      tag,
+      selector: uniqueSelector(el),
+    };
+    const role = el.getAttribute("role");
+    if (role) entry.role = role;
+
+    if (tag === "input") {
+      const inp = el as HTMLInputElement;
+      if (inp.type && inp.type !== "text") entry.type = inp.type;
+      if (inp.placeholder) entry.placeholder = inp.placeholder.slice(0, 60);
+      if (inp.type === "checkbox" || inp.type === "radio") {
+        entry.checked = inp.checked;
+      } else if (inp.type !== "password" && inp.value) {
+        entry.value = inp.value.slice(0, 80);
+      }
+      if (inp.disabled) entry.disabled = true;
+    } else if (tag === "textarea") {
+      const ta = el as HTMLTextAreaElement;
+      if (ta.placeholder) entry.placeholder = ta.placeholder.slice(0, 60);
+      if (ta.value) entry.value = ta.value.slice(0, 80);
+      if (ta.disabled) entry.disabled = true;
+    } else if (tag === "select") {
+      const sel = el as HTMLSelectElement;
+      const opt = sel.selectedOptions[0]?.textContent?.trim();
+      if (opt) entry.value = opt.slice(0, 80);
+      if (sel.disabled) entry.disabled = true;
+    } else if (tag === "label") {
+      const forId = el.getAttribute("for");
+      const target = forId
+        ? (document.getElementById(forId) as HTMLInputElement | null)
+        : null;
+      if (target && (target.type === "checkbox" || target.type === "radio")) {
+        entry.type = target.type;
+        entry.checked = target.checked;
+        if (target.disabled) entry.disabled = true;
+      }
+    } else {
+      if ((el as HTMLButtonElement).disabled) entry.disabled = true;
+      if (tag === "a") {
+        const href = el.getAttribute("href");
+        if (href) entry.href = href.slice(0, 120);
+      }
+    }
+
+    const labelText = (
+      el.getAttribute("aria-label") ||
+      (el as HTMLElement).textContent ||
+      el.textContent ||
+      ""
+    )
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    if (labelText) entry.text = labelText;
+
+    elements.push(entry);
+  }
+
+  const out: PageSnapshot = {
+    url: location.href,
+    title: document.title,
+    text,
+    elements,
+  };
+  if (textTruncated || extraElements > 0) {
+    out.truncated = {
+      ...(textTruncated ? { text: true } : {}),
+      ...(extraElements > 0 ? { elements: extraElements } : {}),
+    };
+  }
+  return out;
+}
+
+/** In page: compact title + text preview for actionable timeout errors. */
+export function pagePreviewInPage(): { title: string; text: string } {
+  return {
+    title: document.title,
+    text: (document.body?.textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200),
+  };
 }

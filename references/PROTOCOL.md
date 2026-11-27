@@ -19,29 +19,39 @@ with `CdpConnectionClosedError`.
 
 ## Navigate and extract
 
-`goto(url)` sends `Page.navigate`, throws on its `errorText`, then waits as
-`settle()` does: until the document is parsed and the page's own session has
-had no request in flight for `quietMs`. That count starts when the call does,
-so each takes at least `quietMs`; frames in another process and WebSockets are
-not counted, and a request that never ends runs out `timeoutMs`. Every probe
-starts with `Network` enabled for this; a probe that sends `Network.disable`
-leaves `settle` blind.
+`goto(url, { wait = "settle", quietMs, timeoutMs })` sends `Page.navigate`,
+throws on `errorText`, then waits event-driven:
+
+- `"settle"` (default): calls `settle()` — waits for parsed DOM and no tracked
+  request in flight for `quietMs` (300 ms), up to `timeoutMs` (5 s). Streaming
+  and fire-and-forget traffic (`EventSource`, `text/event-stream`, `WebSocket`,
+  `Media`, `Ping`, `Prefetch`, `CSPViolationReport`) is ignored so SSE apps,
+  HMR dev servers and audio/video pages settle quickly instead of timing out.
+- `"dom"`: waits for `Page.domContentEventFired` (up to `timeoutMs`, 15 s).
+  Use `"dom"` when `waitFor()` follows immediately so you do not pay a network
+  quiet wait before `waitFor` starts.
+- `"load"`: waits for `Page.loadEventFired` (up to `timeoutMs`, 15 s).
+- `"none"`: returns as soon as `Page.navigate` accepts.
+
+Every probe starts with `Network` and `Page` enabled for these events; disabling
+either leaves `settle` or `goto` blind.
 
 Settling says the page went quiet, not that it shows what you need: wait for
 the page state the next step needs. `waitFor(fn, { args, timeoutMs,
-intervalMs })` returns a page predicate's first truthy value, waiting up to 30 s
-by default. The page re-checks it on every DOM change and on hashchange,
-popstate, readystatechange, load and error events, so a state the DOM shows
-answers as it happens. Node also re-evaluates it every `intervalMs` (250 ms),
-which catches what no event announces, such as a script variable, and a page
-with scripts disabled, where the page cannot report. A redirect, reload or bot
-check that replaces the document costs one retry. One long `evaluate`, such as an in-page polling loop, fails with
+intervalMs })` returns a page predicate's first truthy value, waiting up to 15 s
+by default. The page re-checks it on DOM mutations (coalesced to at most every
+50 ms during hydration storms) and on hashchange, popstate, readystatechange,
+load and error events, so DOM state answers immediately. Node also re-evaluates
+every `intervalMs` (250 ms) for script variables or pages with scripts disabled.
+A redirect, reload or bot check that replaces the document costs one retry. One
+long `evaluate`, such as an in-page polling loop, fails with
 `Inspected target navigated or closed` when that happens, even after the load
-event. Match the block page as well as the content, so a challenge returns
-instead of timing out:
+event. On timeout with no page error, `waitFor` includes the page's title and a
+short text preview in the error message. Match the block page as well as the
+content, so a challenge returns instead of timing out:
 
 ```js
-const page = await goto("https://example.com/search");
+const page = await goto("https://example.com/search", { wait: "dom" });
 const found = await waitFor(() => {
   const text = document.body?.innerText ?? "";
   if (!/results|access denied|verify you are human/i.test(text)) return null;
@@ -53,9 +63,13 @@ const found = await waitFor(() => {
       loaded: img.complete && img.naturalWidth > 0,
     })),
   };
-}, { timeoutMs: 45000 });
+}, { timeoutMs: 30000 });
 return { ...page, ...found };
 ```
+
+On an unfamiliar page, call `snapshot({ selector, maxText, maxElements })` to
+get normalized visible text plus visible interactive controls with verified
+unique CSS selectors ready for `click()`, instead of writing custom DOM dumps.
 
 Headless Chrome has no PDF viewer: a navigation to a PDF downloads it rather
 than rendering it, so fetch a PDF's bytes instead of printing its page.

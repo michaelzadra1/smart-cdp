@@ -641,7 +641,7 @@ socket.onmessage = async ({ data }) => {
     const expected = createHmac("sha256", secret).update("c:" + id).digest("hex");
     return message.proof === expected ? ready() : socket.close();
   }
-  if (message.type === "reset") return resets++, ready();
+  if (message.type === "reset") return setTimeout(() => { resets++; ready(); }, 150);
   if (message.type === "close") {
     await Bun.write(process.env.FAKE_TAB_CLOSED, "closed");
     return socket.close();
@@ -1133,8 +1133,10 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
           { args: ["2024"], timeoutMs: 10000 }
         );
         await click("#field", { timeoutMs: 10000 });
-        await type("Ab1 .");
+        await type("Ab1 .-é");
+        await press("-");
         await press("Enter");
+        await type("fast", { fast: true });
         const failures = await Promise.all(
           [
             click("#under", { timeoutMs: 300 }),
@@ -1156,7 +1158,7 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
     expect(paints).toBe(0);
     expect(clickMs).toBeLessThan(4000);
     expect(title).toBe("picked 2024");
-    expect(value).toBe("Ab1 .");
+    expect(value).toBe("Ab1 .-é-fast");
     expect(events.filter(([, trusted]) => !trusted)).toEqual([]);
     const on = (id: string) =>
       events
@@ -1179,13 +1181,16 @@ test("click, type and press send trusted input, in a hidden tab too", async () =
       ["b", 66, false],
       ["1", 49, false],
       [" ", 32, false],
+      [".", 190, false],
+      ["-", 189, false],
+      ["-", 189, false],
       ["Enter", 13, false],
     ]);
     expect(failures[0]).toMatch(
       /^click timed out after 300ms on http:.*: #under is covered by <div#overlay>$/
     );
     expect(failures[1]).toMatch(/: #missing matched no element$/);
-    expect(failures[2]).toMatch(/^press: unknown key "F13"; use a letter/);
+    expect(failures[2]).toMatch(/^press: unknown key "F13"; use a US key/);
     expect(failures[3]).toBe(
       "waitFor: unknown option timeout; it takes args, timeoutMs, intervalMs"
     );
@@ -1479,3 +1484,148 @@ test('a "Leave site?" dialog cannot block navigation', async () => {
     await close(server);
   }
 });
+
+test("goto settles past SSE/beacons, supports wait: dom, snapshot returns clickable selectors, and click is event-driven", async () => {
+  const streams: Set<ReturnType<typeof setInterval>> = new Set();
+  const server = await serve((req, res) => {
+    if (req.url === "/sse" || req.url === "/sse-fetch") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+      });
+      res.write("data: ok\n\n");
+      const timer = setInterval(() => res.write("data: ping\n\n"), 500);
+      streams.add(timer);
+      req.on("close", () => {
+        clearInterval(timer);
+        streams.delete(timer);
+      });
+      return;
+    }
+    if (req.url === "/slow-fetch") {
+      setTimeout(() => res.end("done"), 1500);
+      return;
+    }
+    if (req.url === "/ping") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.setHeader("Content-Type", "text/html");
+    if (req.url === "/streaming") {
+      res.end(`<title>Live App</title><main><h1>Ready</h1>
+        <button id="show-late">Show</button>
+        <button style="display:none" id="hidden-btn">Hidden</button>
+        <input type="radio" id="plan-pro" name="plan" style="display:none">
+        <label for="plan-pro" style="display:inline-block;padding:8px">Pro Plan</label>
+        <input name="q" placeholder="Search">
+      </main><script>
+        new EventSource("/sse");
+        fetch("/sse-fetch");
+        navigator.sendBeacon("/ping", "x");
+        document.getElementById("show-late").onclick = () => setTimeout(() => {
+          const btn = document.createElement("button");
+          btn.id = "late-btn";
+          btn.textContent = "Late";
+          btn.dataset.at = String(performance.now());
+          btn.onclick = () => (document.title = "Late Clicked");
+          document.body.append(btn);
+        }, 300);
+      </script>`);
+      return;
+    }
+    res.end(`<title>Slow Fetch Page</title><h1>Parsed</h1>
+      <script>fetch("/slow-fetch");</script>`);
+  });
+  try {
+    const base = `http://127.0.0.1:${portOf(server)}`;
+    const result = await runProbe(
+      parseOptions(["--once"]),
+      async ({ goto, snapshot, click, waitFor, evaluate }) => {
+        const t0 = Date.now();
+        const streamPage = await goto(`${base}/streaming`);
+        const streamMs = Date.now() - t0;
+
+        const snap = await snapshot({ selector: "main" });
+        const label = snap.elements.find((e) => e.text === "Pro Plan");
+        if (label) await click(label.selector);
+        const checkedAfter = await evaluate(
+          () =>
+            (document.getElementById("plan-pro") as HTMLInputElement).checked
+        );
+
+        // Trigger a late-rendering button and click it with a 5s poll interval:
+        // only the event-driven watch can land it within ~1s.
+        await click("#show-late");
+        await click("#late-btn", { intervalMs: 5000, timeoutMs: 5000 });
+        const clickLag = await evaluate(
+          () =>
+            performance.now() -
+            Number(document.getElementById("late-btn")?.dataset.at)
+        );
+        const afterTitle = await evaluate(() => document.title);
+
+        // waitFor timeout reports a page preview when no page error occurred.
+        const previewErr = await waitFor(() => false, {
+          timeoutMs: 250,
+        }).catch(message);
+
+        // Same-document hash goto resolves immediately.
+        const tHash = Date.now();
+        const hashPage = await goto(`${base}/streaming#part`, { wait: "dom" });
+        const hashMs = Date.now() - tHash;
+
+        // wait: "dom" does not wait for the 1500ms /slow-fetch.
+        const tDom = Date.now();
+        const domPage = await goto(`${base}/slow-page`, { wait: "dom" });
+        const domMs = Date.now() - tDom;
+
+        const badWait = await goto(`${base}/slow-page`, {
+          wait: "bogus" as never,
+        }).catch(message);
+
+        return {
+          streamPage,
+          streamMs,
+          snap,
+          checkedAfter,
+          clickLag,
+          afterTitle,
+          previewErr,
+          hashPage,
+          hashMs,
+          domPage,
+          domMs,
+          badWait,
+        };
+      }
+    );
+
+    expect(result.streamPage).toMatchObject({ status: 200, settled: true });
+    expect(result.streamMs).toBeLessThan(2500);
+    expect(result.snap.title).toBe("Live App");
+    expect(result.snap.elements.some((e) => e.text === "Hidden")).toBe(false);
+    expect(result.snap.elements.some((e) => e.text === "Pro Plan")).toBe(true);
+    expect(result.checkedAfter).toBe(true);
+    expect(result.afterTitle).toBe("Late Clicked");
+    expect(result.clickLag).toBeLessThan(1500);
+    expect(result.previewErr).toMatch(/title="Late Clicked"/);
+    expect(result.hashPage.settled).toBe(true);
+    expect(result.hashMs).toBeLessThan(500);
+    expect(result.domPage).toMatchObject({ status: 200, settled: true });
+    expect(result.domMs).toBeLessThan(1000);
+    expect(result.badWait).toMatch(/goto: unknown wait "bogus"/);
+
+    // Static import in stdin gives an actionable message instead of a cryptic SyntaxError.
+    const badImport = await cli('import fs from "node:fs"; return 1;', [
+      "--once",
+    ]);
+    expect(badImport.status).toBe(1);
+    expect(badImport.stderr).toMatch(
+      /static `import` statements are not allowed/
+    );
+  } finally {
+    for (const timer of streams) clearInterval(timer);
+    await close(server);
+  }
+}, 30000);

@@ -29,12 +29,22 @@ import { electronApp } from "./electron";
 import {
   changedInPage,
   inPageCall,
+  type PageSnapshot,
+  pagePreviewInPage,
   returnByValueInPage,
+  snapshotInPage,
   stopWatchInPage,
   type WatchResult,
   watchInPage,
 } from "./in-page";
-import { clickPointInPage, type Point, press, pressAt, type } from "./input";
+import {
+  clickPointInPage,
+  type Point,
+  press,
+  pressAt,
+  type,
+  watchClickInPage,
+} from "./input";
 import { trackNetwork } from "./network";
 import { holdPressAndHoldButton, type PressAndHoldResult } from "./press-hold";
 import { clickRecaptchaCheckbox } from "./recaptcha";
@@ -71,19 +81,35 @@ export type Click = <A extends unknown[]>(
 type SettleOptions = { quietMs?: number; timeoutMs?: number };
 
 /**
- * Waits until the document is parsed and the page has had no request in
- * flight for `quietMs`; false if that took longer than `timeoutMs`.
+ * Waits event-driven until the document is parsed and the page has had no
+ * non-streaming request in flight for `quietMs`; false after `timeoutMs`.
  */
 export type Settle = (options?: SettleOptions) => Promise<boolean>;
 
+type GotoWait = "settle" | "dom" | "load" | "none";
+type GotoOptions = SettleOptions & { wait?: GotoWait };
+
 /**
- * Navigates and settles. Throws when the navigation fails; a slow page
- * resolves with `settled: false`. `status` is the document's HTTP status.
+ * Navigates and waits according to `wait` (default `"settle"`). Use
+ * `{ wait: "dom" }` when following immediately with `waitFor()` so you do not
+ * wait for network quiet first. Throws when the navigation fails; returns
+ * `{ url, status, settled }`.
  */
 export type Goto = (
   url: string,
-  options?: SettleOptions
+  options?: GotoOptions
 ) => Promise<{ url: string; status: number | undefined; settled: boolean }>;
+
+type SnapshotOptions = {
+  selector?: string;
+  maxText?: number;
+  maxElements?: number;
+};
+
+/** Compact page overview: normalized visible text + visible interactive controls with click() selectors. */
+export type Snapshot = (options?: SnapshotOptions) => Promise<PageSnapshot>;
+
+type TypeOptions = { fast?: boolean };
 
 /** Saves a .png, .jpg or .webp of the viewport, or the full page; returns the path. */
 export type Screenshot = (
@@ -101,9 +127,10 @@ export type ProbeContext = {
   goto: Goto;
   settle: Settle;
   waitFor: WaitFor;
+  snapshot: Snapshot;
   screenshot: Screenshot;
   click: Click;
-  type: (text: string) => Promise<void>;
+  type: (text: string, options?: TypeOptions) => Promise<void>;
   press: (key: string) => Promise<void>;
   clickRecaptchaCheckbox: () => Promise<boolean>;
   clickTurnstileCheckbox: () => Promise<boolean>;
@@ -116,6 +143,10 @@ const SESSION_IDLE_MS = 30 * 60 * 1000;
 
 const POLL_OPTIONS = ["args", "timeoutMs", "intervalMs"];
 const SETTLE_OPTIONS = ["quietMs", "timeoutMs"];
+const GOTO_OPTIONS = ["wait", "quietMs", "timeoutMs"];
+const GOTO_WAITS = new Set<GotoWait>(["settle", "dom", "load", "none"]);
+const SNAPSHOT_OPTIONS = ["selector", "maxText", "maxElements"];
+const TYPE_OPTIONS = ["fast"];
 const SCREENSHOT_FORMATS: Record<string, "png" | "jpeg" | "webp"> = {
   ".png": "png",
   ".jpg": "jpeg",
@@ -179,24 +210,26 @@ CHROME_BIN overrides executable discovery. Requires macOS, Bun and Chrome.
 stdin is an async JavaScript function body. --file paths resolve from your cwd;
 type a --file probe with the ProbeContext type exported by probe.ts.
 Context: { cdp, send, sessionId, targetId, evaluate, goto, settle, waitFor,
-  screenshot, click, type, press, clickRecaptchaCheckbox, clickTurnstileCheckbox,
-  holdPressAndHoldButton }
+  snapshot, screenshot, click, type, press, clickRecaptchaCheckbox,
+  clickTurnstileCheckbox, holdPressAndHoldButton }
 send(method, params) addresses the bound page. cdp is the browser-level CDP client.
 evaluate(fn, ...args) serializes a self-contained page function and JSON arguments,
 and returns its JSON value; a returned DOM element throws.
-goto(url, { quietMs, timeoutMs }) navigates, then settles; returns { url, status,
-settled } with the final URL and the document's HTTP status. A failed navigation
-throws; a page still busy after timeoutMs returns settled: false.
-settle({ quietMs = 500, timeoutMs = 10000 }) waits, instead of a sleep, until the
-document is parsed and no request has been in flight for quietMs; false on timeout.
+goto(url, { wait = "settle", quietMs, timeoutMs }) navigates and waits:
+  "settle" (default: event-driven DOM + quiet network), "dom" (DOMContentLoaded,
+  fast before waitFor), "load" (load event), or "none". Returns { url, status, settled }.
+settle({ quietMs = 300, timeoutMs = 5000 }) waits event-driven until the document
+is parsed and no non-streaming request has been in flight for quietMs; false on timeout.
+snapshot({ selector, maxText = 3000, maxElements = 60 }) returns normalized page
+text plus visible interactive elements with verified CSS selectors for click().
 screenshot(path, { fullPage }) saves a .png, .jpg or .webp, creating its folder,
 and returns its path.
-waitFor(fn, { args, timeoutMs = 30000, intervalMs = 250 }) returns fn's first truthy
-value: the page re-checks fn on every DOM change and page event, and the host
-polls it every intervalMs, surviving redirects and reloads; throws on timeout.
-click(selector | fn, { args, timeoutMs, intervalMs }) presses the element once it
-is visible and uncovered; type(text) types into the focused element; press(key)
-presses one key such as "Enter". All three send trusted input, unlike el.click().
+waitFor(fn, { args, timeoutMs = 15000, intervalMs = 250 }) returns fn's first truthy
+value, event-driven on DOM/page changes with host fallback; survives redirects.
+click(selector | fn, { args, timeoutMs = 10000, intervalMs = 150 }) waits event-driven
+until visible and uncovered, then sends trusted mouse input.
+type(text, { fast }) sends trusted keystrokes (or instant Input.insertText with fast: true).
+press(key) presses a named key ("Enter", "Escape", ...) or US layout character.
 Returns JSON on stdout. Lifecycle diagnostics go to stderr.
 `;
 
@@ -237,7 +270,9 @@ export function parseOptions(args: string[]) {
         (key) => !["end-session", "timeout-ms"].includes(key)
       )
     )
-      throw new Error("--end-session takes no other options");
+      throw new Error(
+        "--end-session takes no other options (leave out --personal, --session, --app, etc., or pass --release on your last probe instead)"
+      );
   }
   const endpoints = [
     values["ws-url"],
@@ -359,9 +394,9 @@ export const isAlive = (pid: number | undefined) => {
 
 /** Polls until the process is gone; true if it exited within `ms`. */
 export async function waitForExit(pid: number | undefined, ms: number) {
-  for (let waited = 0; isAlive(pid); waited += 50) {
+  for (let waited = 0; isAlive(pid); waited += 20) {
     if (waited >= ms) return false;
-    await delay(50);
+    await delay(20);
   }
   return true;
 }
@@ -535,7 +570,7 @@ async function sessionState(options: ProbeOptions) {
       : `Chrome pid=${state.chromePid} profile=${state.profile}`;
   console.error(
     `Claimed browser ${name}: ${what}. ` +
-      `Continue with --session ${name}; release it with --end-session ${name} when done.${idle}`
+      `Continue with --session ${name}; release it with --end-session ${name} (or --release on the last probe) when done.${idle}`
   );
   return state;
 }
@@ -776,22 +811,51 @@ export async function runProbe<T = unknown>(
       );
     });
     // A personal session's host already holds its one tab, and addresses it
-    // as session.sessionId.
+    // as session.sessionId. For a regular session, attach directly to the
+    // recorded tab to avoid an extra Target.getTargets round trip on every
+    // warm probe; fall back to sessionTab only if that tab was closed.
     const personal = session?.personal ? session : undefined;
-    const targetId =
-      options.target ??
-      personal?.targetId ??
-      (session
-        ? await sessionTab(client, session.targetId)
-        : (
-            await client.Target.createTarget({
-              url: "about:blank",
-              background: true,
-            })
-          ).targetId);
-    const { sessionId } = personal?.sessionId
-      ? { sessionId: personal.sessionId }
-      : await client.Target.attachToTarget({ targetId, flatten: true });
+    let targetId: string;
+    let sessionId: string;
+    if (personal?.sessionId) {
+      targetId = options.target ?? personal.targetId ?? "";
+      sessionId = personal.sessionId;
+    } else if (options.target) {
+      targetId = options.target;
+      ({ sessionId } = await client.Target.attachToTarget({
+        targetId,
+        flatten: true,
+      }));
+    } else if (session?.targetId) {
+      try {
+        targetId = session.targetId;
+        ({ sessionId } = await client.Target.attachToTarget({
+          targetId,
+          flatten: true,
+        }));
+      } catch {
+        targetId = await sessionTab(client, session.targetId);
+        ({ sessionId } = await client.Target.attachToTarget({
+          targetId,
+          flatten: true,
+        }));
+      }
+    } else if (session) {
+      targetId = await sessionTab(client, session.targetId);
+      ({ sessionId } = await client.Target.attachToTarget({
+        targetId,
+        flatten: true,
+      }));
+    } else {
+      ({ targetId } = await client.Target.createTarget({
+        url: "about:blank",
+        background: true,
+      }));
+      ({ sessionId } = await client.Target.attachToTarget({
+        targetId,
+        flatten: true,
+      }));
+    }
     const send: Send = (method, params) =>
       client.send(method, params ?? {}, sessionId);
     // "Leave site?" blocks Page.navigate and every command after it until
@@ -856,6 +920,20 @@ export async function runProbe<T = unknown>(
         ]));
       return typeof url === "string" ? url : "a closed page";
     };
+    const pagePreview = async () => {
+      const preview = (await Promise.race([
+        evaluateOnce(inPageCall(pagePreviewInPage)).catch(() => null),
+        delay(1000, null, { ref: false }),
+      ])) as { title?: unknown; text?: unknown } | null;
+      if (!preview || typeof preview.title !== "string") return "";
+      const text = typeof preview.text === "string" ? preview.text : "";
+      if (!preview.title && !text) return "";
+      const parts = [
+        preview.title ? `title=${JSON.stringify(preview.title)}` : "",
+        text ? `text=${JSON.stringify(text)}` : "",
+      ].filter(Boolean);
+      return `; page ${parts.join(" ")}`;
+    };
     // Tries from the host with short evaluations until `done` accepts a
     // value: a redirect or reload between tries costs one retry, where one
     // long in-page wait fails outright. Resolves with that value as `found`,
@@ -866,18 +944,29 @@ export async function runProbe<T = unknown>(
       intervalMs: number,
       done: (value: unknown) => boolean,
       /** Ends it quietly, with undefined: something else answered. */
-      stopped?: AbortSignal
+      stopped?: AbortSignal,
+      initial?: { delayMs?: number; last?: unknown; lastError?: Error }
     ) => {
       const deadline = Date.now() + timeoutMs;
       const late = Symbol("late");
-      let last: unknown;
-      let lastError: Error | undefined;
+      let last: unknown = initial?.last;
+      let lastError: Error | undefined = initial?.lastError;
+      if (initial?.delayMs && initial.delayMs > 0) {
+        const wait = Math.min(
+          initial.delayMs,
+          Math.max(deadline - Date.now(), 0)
+        );
+        if (wait > 0)
+          await delay(wait, undefined, { signal: stopped }).catch(() => {});
+      }
       for (;;) {
         if (stopped?.aborted) return undefined;
+        const remaining = Math.max(deadline - Date.now(), 0);
+        if (remaining === 0 && (last !== undefined || lastError !== undefined))
+          break;
         const trying = attempt();
         trying.catch(() => {});
         try {
-          const remaining = Math.max(deadline - Date.now(), 0);
           const value = await Promise.race([
             trying,
             delay(remaining, late, { ref: false }),
@@ -899,7 +988,7 @@ export async function runProbe<T = unknown>(
           lastError = failure;
         }
         if (Date.now() >= deadline) break;
-        await delay(intervalMs);
+        await delay(intervalMs, undefined, { signal: stopped }).catch(() => {});
       }
       return { last, lastError };
     };
@@ -909,27 +998,33 @@ export async function runProbe<T = unknown>(
       name: string,
       attempt: () => Promise<unknown>,
       options: PollOptions<unknown[]>,
+      defaults: { timeoutMs: number; intervalMs: number },
       done: (value: unknown) => boolean,
-      explain: (last: unknown, lastError?: string) => string,
-      stopped?: AbortSignal
+      explain: (last: unknown, lastError?: string) => Promise<string> | string,
+      stopped?: AbortSignal,
+      initial?: { delayMs?: number; last?: unknown; lastError?: Error }
     ) => {
-      knownOptions(name, options, POLL_OPTIONS);
-      const { timeoutMs = 30000, intervalMs = 250 } = options;
-      const result = await until(attempt, timeoutMs, intervalMs, done, stopped);
+      const timeoutMs = options.timeoutMs ?? defaults.timeoutMs;
+      const intervalMs = options.intervalMs ?? defaults.intervalMs;
+      const result = await until(
+        attempt,
+        timeoutMs,
+        intervalMs,
+        done,
+        stopped,
+        initial
+      );
       if (!result || "found" in result) return result?.found;
       throw new Error(
         `${name} timed out after ${timeoutMs}ms on ${await pageUrl()}` +
-          explain(result.last, result.lastError?.message.split("\n")[0])
+          (await explain(result.last, result.lastError?.message.split("\n")[0]))
       );
     };
-    // Settles with fn's first truthy value from the page, which re-checks it on
-    // every DOM change or page event (watchInPage), unless the host poll gets
-    // there first. A new document ends a watch, so it is watched again.
-    // Settles once the watch is over: with the value, or undefined once ended
-    // or impossible; throws ReturnedNodeError.
-    const watch = async <A extends unknown[]>(
-      fn: (...args: A) => unknown,
-      args: A,
+    // Settles with the watch expression's first truthy value from the page,
+    // which re-checks on DOM changes and page events, unless the host poll
+    // gets there first. A new document ends a watch, so it is re-installed.
+    const watch = async (
+      expression: string,
       ended: AbortSignal
     ): Promise<{ value: unknown } | undefined> => {
       while (!ended.aborted) {
@@ -942,9 +1037,7 @@ export async function runProbe<T = unknown>(
             }).catch(() => {});
         };
         try {
-          const handle = await send("Runtime.evaluate", {
-            expression: inPageCall(watchInPage, fn, args),
-          });
+          const handle = await send("Runtime.evaluate", { expression });
           objectId = handle.result.objectId;
           if (handle.exceptionDetails || !objectId) break;
           ended.addEventListener("abort", stop, { once: true });
@@ -978,9 +1071,12 @@ export async function runProbe<T = unknown>(
     // Answers as the page changes, through watch; the host poll still covers
     // what no event announces, such as script state or a page with scripts off.
     const waitFor: WaitFor = async (fn, options = {}) => {
+      knownOptions("waitFor", options, POLL_OPTIONS);
       const args = options.args ?? ([] as never);
+      const timeoutMs = options.timeoutMs ?? 15000;
+      const intervalMs = options.intervalMs ?? 250;
       const ended = new AbortController();
-      const watching = watch(fn, args, ended.signal);
+      const watching = watch(inPageCall(watchInPage, fn, args), ended.signal);
       // Without a watch, as on a page with scripts off, the poll alone answers.
       const changed = watching.then((found) =>
         found ? found.value : new Promise<never>(() => {})
@@ -992,9 +1088,15 @@ export async function runProbe<T = unknown>(
             "waitFor",
             () => evaluateValue(fn, args),
             options,
+            { timeoutMs: 15000, intervalMs: 250 },
             Boolean,
-            (_, error) => (error ? `; last error: ${error}` : ""),
-            ended.signal
+            async (_, error) =>
+              error ? `; last error: ${error}` : await pagePreview(),
+            ended.signal,
+            // Give watchInPage's immediate check a head start to avoid a
+            // duplicate Runtime.evaluate at t=0, while still guaranteeing a
+            // host poll runs before short timeouts expire.
+            { delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)) }
           ),
           changed,
         ])) as never;
@@ -1009,31 +1111,79 @@ export async function runProbe<T = unknown>(
     };
     const settle: Settle = async (options = {}) => {
       knownOptions("settle", options, SETTLE_OPTIONS);
-      const { quietMs = 500, timeoutMs = 10000 } = options;
-      const began = Date.now();
-      // Parsed, not loaded: load waits on every frame, and a slow third-party
-      // frame can hold it back for good.
-      const result = await until(
-        async () =>
-          network.quietMs(began) >= quietMs &&
-          (await evaluateValue(() => document.readyState !== "loading", [])),
-        timeoutMs,
-        50,
-        Boolean
+      const { quietMs = 300, timeoutMs = 5000 } = options;
+      // Event-driven: parsed DOM + no non-streaming requests in flight for quietMs.
+      return network.waitQuiet(quietMs, timeoutMs, () =>
+        evaluateValue(() => document.readyState !== "loading", []).then(Boolean)
       );
-      return Boolean(result && "found" in result);
     };
     const goto: Goto = async (url, options = {}) => {
-      knownOptions("goto", options, SETTLE_OPTIONS);
-      const navigation = await send("Page.navigate", { url });
-      if (navigation.errorText)
-        throw new Error(`goto ${url}: ${navigation.errorText}`);
-      const settled = await settle(options);
+      knownOptions("goto", options, GOTO_OPTIONS);
+      const wait: GotoWait = options.wait ?? "settle";
+      if (!GOTO_WAITS.has(wait))
+        throw new Error(
+          `goto: unknown wait ${JSON.stringify(wait)}; use "settle", "dom", "load" or "none"`
+        );
+      let settled = false;
+      let loaderId: string | undefined;
+      if (wait === "dom" || wait === "load") {
+        // Subscribe before navigating so fast local/cached pages never race.
+        let onDom: (() => void) | undefined;
+        let onLoad: (() => void) | undefined;
+        const fired = new Promise<boolean>((resolve) => {
+          onLoad = () => resolve(true);
+          client.once(`Page.loadEventFired.${sessionId}`, onLoad);
+          if (wait === "dom") {
+            onDom = () => resolve(true);
+            client.once(`Page.domContentEventFired.${sessionId}`, onDom);
+          }
+        });
+        const cleanupWait = () => {
+          if (onDom)
+            client.off(`Page.domContentEventFired.${sessionId}`, onDom);
+          if (onLoad) client.off(`Page.loadEventFired.${sessionId}`, onLoad);
+        };
+        try {
+          const navigation = await send("Page.navigate", { url });
+          if (navigation.errorText)
+            throw new Error(`goto ${url}: ${navigation.errorText}`);
+          loaderId = navigation.loaderId;
+          // No loaderId means same-document (hash) navigation: no lifecycle event fires.
+          settled = !loaderId
+            ? true
+            : await Promise.race([
+                fired,
+                delay(options.timeoutMs ?? 15000, false, { ref: false }),
+              ]);
+        } finally {
+          cleanupWait();
+        }
+      } else {
+        const navigation = await send("Page.navigate", { url });
+        if (navigation.errorText)
+          throw new Error(`goto ${url}: ${navigation.errorText}`);
+        loaderId = navigation.loaderId;
+        if (wait === "settle") {
+          const settleOpts: SettleOptions = {};
+          if (options.quietMs !== undefined)
+            settleOpts.quietMs = options.quietMs;
+          if (options.timeoutMs !== undefined)
+            settleOpts.timeoutMs = options.timeoutMs;
+          settled = await settle(settleOpts);
+        }
+      }
       return {
         url: await evaluateValue(() => location.href, []).catch(pageUrl),
-        status: network.status(navigation.loaderId),
+        status: network.status(loaderId),
         settled,
       };
+    };
+    const snapshot: Snapshot = async (options = {}) => {
+      knownOptions("snapshot", options, SNAPSHOT_OPTIONS);
+      const { selector = null, maxText = 3000, maxElements = 60 } = options;
+      return (await evaluateOnce(
+        inPageCall(snapshotInPage, selector, maxText, maxElements)
+      )) as PageSnapshot;
     };
     const screenshot: Screenshot = async (path, options = {}) => {
       knownOptions("screenshot", options, ["fullPage"]);
@@ -1058,6 +1208,7 @@ export async function runProbe<T = unknown>(
       return file;
     };
     const click: Click = async (target, options = {}) => {
+      knownOptions("click", options, POLL_OPTIONS);
       const [find, args, label] =
         typeof target === "string"
           ? [
@@ -1066,21 +1217,81 @@ export async function runProbe<T = unknown>(
               target,
             ]
           : [target, options.args ?? [], "the element"];
-      const point = await poll(
-        "click",
-        () =>
-          evaluateOnce(
-            inPageCall(
-              clickPointInPage,
-              find as (...args: unknown[]) => unknown,
-              args
-            )
-          ),
-        options,
-        (value) => typeof value === "object" && value !== null && "x" in value,
-        (last, error) =>
-          `: ${label} ${(last as { miss?: string } | undefined)?.miss ?? `failed: ${error}`}`
+      const checkPoint = () =>
+        evaluateOnce(
+          inPageCall(
+            clickPointInPage,
+            find as (...args: unknown[]) => unknown,
+            args
+          )
+        );
+      const isPoint = (value: unknown) =>
+        typeof value === "object" && value !== null && "x" in value;
+      // Fast path: most clicks target an element already rendered on the page.
+      let initialLast: unknown;
+      let initialError: Error | undefined;
+      try {
+        const immediate = await checkPoint();
+        if (isPoint(immediate)) {
+          await pressAt(send, immediate as Point);
+          return;
+        }
+        initialLast = immediate;
+      } catch (error) {
+        const failure = error as Error;
+        if (
+          failure instanceof CdpProtocolError &&
+          !navigated.test(failure.message)
+        )
+          throw failure;
+        initialError = failure;
+      }
+      // Event-driven wait: watch DOM mutations + load events for the element
+      // to appear/uncover, backed by host polling for CSS/script/no-JS changes.
+      const timeoutMs = options.timeoutMs ?? 10000;
+      const intervalMs = options.intervalMs ?? 150;
+      const ended = new AbortController();
+      const watching = watch(
+        inPageCall(
+          watchClickInPage,
+          watchInPage,
+          clickPointInPage,
+          find as (...args: unknown[]) => unknown,
+          args
+        ),
+        ended.signal
       );
+      const changed = watching.then((found) =>
+        found ? found.value : new Promise<never>(() => {})
+      );
+      changed.catch(() => {});
+      let point: unknown;
+      try {
+        point = await Promise.race([
+          poll(
+            "click",
+            checkPoint,
+            options,
+            { timeoutMs: 10000, intervalMs: 150 },
+            isPoint,
+            (last, error) =>
+              `: ${label} ${(last as { miss?: string } | undefined)?.miss ?? `failed: ${error}`}`,
+            ended.signal,
+            {
+              delayMs: Math.min(intervalMs, Math.floor(timeoutMs / 2)),
+              last: initialLast,
+              lastError: initialError,
+            }
+          ),
+          changed,
+        ]);
+      } finally {
+        ended.abort();
+        await Promise.race([
+          watching.catch(() => {}),
+          delay(1000, undefined, { ref: false }),
+        ]);
+      }
       await pressAt(send, point as Point);
     };
     const context: ProbeContext = {
@@ -1092,20 +1303,38 @@ export async function runProbe<T = unknown>(
       goto,
       settle,
       waitFor,
+      snapshot,
       screenshot,
       click,
-      type: (text) => type(send, text),
+      type: (text, typeOptions) => {
+        if (typeOptions) knownOptions("type", typeOptions, TYPE_OPTIONS);
+        return type(send, text, typeOptions);
+      },
       press: (key) => press(send, key),
       clickRecaptchaCheckbox: () => clickRecaptchaCheckbox({ send, evaluate }),
       clickTurnstileCheckbox: () => clickTurnstileCheckbox({ send, evaluate }),
       holdPressAndHoldButton: () => holdPressAndHoldButton({ send }),
     };
-    const run =
-      typeof snippet === "string"
-        ? // The block lets a probe declare its own names, such as a helper
-          // called click, over the context's.
-          new AsyncFunction(`{ ${Object.keys(context)} }`, `{\n${snippet}\n}`)
-        : snippet;
+    let run: Probe<T>;
+    if (typeof snippet === "string") {
+      try {
+        // The block lets a probe declare its own names, such as a helper
+        // called click, over the context's.
+        run = new AsyncFunction(
+          `{ ${Object.keys(context)} }`,
+          `{\n${snippet}\n}`
+        ) as Probe<T>;
+      } catch (error) {
+        if (error instanceof SyntaxError && /^\s*import\s+/m.test(snippet)) {
+          throw new SyntaxError(
+            'stdin probe code is an async function body, so static `import` statements are not allowed: use `await import("node:fs/promises")`, `Bun.file()`/`Bun.write()`, or `--file`'
+          );
+        }
+        throw error;
+      }
+    } else {
+      run = snippet;
+    }
     try {
       return (await run(context)) as T;
     } finally {

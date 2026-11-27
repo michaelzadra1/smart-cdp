@@ -1,11 +1,39 @@
 import type { CdpClient } from "./cdp";
 import type { Send } from "./probe";
 
+// Streaming, push and fire-and-forget resource types that never mark a page
+// as still loading. Including them made settle() burn its full timeout on SSE
+// apps, HMR dev servers, audio/video streams and analytics beacons.
+const IGNORED_TYPES = new Set([
+  "EventSource",
+  "WebSocket",
+  "Media",
+  "Ping",
+  "CSPViolationReport",
+  "Prefetch",
+]);
+
+function isEventStream(response: {
+  mimeType?: string;
+  headers?: Record<string, string>;
+}) {
+  if (response.mimeType?.toLowerCase().includes("text/event-stream"))
+    return true;
+  for (const [name, value] of Object.entries(response.headers ?? {})) {
+    if (
+      name.toLowerCase() === "content-type" &&
+      String(value).toLowerCase().includes("text/event-stream")
+    )
+      return true;
+  }
+  return false;
+}
+
 /**
- * Follows the bound page's requests, so a probe can wait for the network to go
- * quiet rather than sleep. Every probe has it: an action's request can start
- * before a later settle() could enable Network, and following costs about 70
- * microseconds a request.
+ * Follows the bound page's requests and document lifecycle events so settle()
+ * and goto() wait event-driven instead of polling or sleeping. Every probe has
+ * it: an action's request can start before a later settle() could enable
+ * Network, and following costs about 70 microseconds a request.
  */
 export async function trackNetwork(
   cdp: CdpClient,
@@ -14,36 +42,134 @@ export async function trackNetwork(
 ) {
   const inFlight = new Set<string>();
   const documentStatus = new Map<string, number>();
+  const waiters = new Set<() => void>();
   let lastActivity = Date.now();
-  const ended = ({ requestId }: { requestId: string }) => {
-    inFlight.delete(requestId);
-    lastActivity = Date.now();
+  let domReady = false;
+
+  const notify = () => {
+    for (const wake of waiters) wake();
   };
-  cdp.on(`Network.requestWillBeSent.${sessionId}`, ({ requestId }) => {
+
+  const ended = ({ requestId }: { requestId: string }) => {
+    if (!inFlight.delete(requestId)) return;
+    lastActivity = Date.now();
+    notify();
+  };
+
+  cdp.on(`Network.requestWillBeSent.${sessionId}`, ({ requestId, type }) => {
+    if (type && IGNORED_TYPES.has(type)) return;
     inFlight.add(requestId);
     lastActivity = Date.now();
+    notify();
   });
+
   cdp.on(
     `Network.responseReceived.${sessionId}`,
     ({ requestId, type, response }) => {
       if (type === "Document") documentStatus.set(requestId, response.status);
+      // fetch()-based SSE streams start as type "Fetch" and only announce
+      // text/event-stream when headers arrive.
+      if ((type && IGNORED_TYPES.has(type)) || isEventStream(response)) {
+        if (inFlight.delete(requestId)) {
+          lastActivity = Date.now();
+          notify();
+        }
+      }
     }
   );
+
   // Chrome reports no end for the requests a replaced document left
-  // unfinished, so a new document starts the count again.
+  // unfinished, so a new main document resets the count and waits for its DOM.
   cdp.on(`Page.frameNavigated.${sessionId}`, ({ frame }) => {
-    if (!frame.parentId) inFlight.clear();
+    if (!frame.parentId) {
+      inFlight.clear();
+      domReady = false;
+      lastActivity = Date.now();
+      notify();
+    }
   });
+
+  const markDomReady = () => {
+    domReady = true;
+    notify();
+  };
+  cdp.on(`Page.domContentEventFired.${sessionId}`, markDomReady);
+  cdp.on(`Page.loadEventFired.${sessionId}`, markDomReady);
   cdp.on(`Network.loadingFinished.${sessionId}`, ended);
   cdp.on(`Network.loadingFailed.${sessionId}`, ended);
+
   await send("Network.enable");
+
   return {
     /**
-     * How long no request has been in flight, counted from `since` at the
-     * earliest: an action's request starts a moment after the action returns.
+     * Event-driven wait until the document is parsed and no tracked request
+     * has been in flight for `quietMs` (counted from the call's start at the
+     * earliest, so a request an action triggers moments later is still caught).
+     * Resolves `false` on `timeoutMs`.
      */
-    quietMs: (since: number) =>
-      inFlight.size ? 0 : Date.now() - Math.max(lastActivity, since),
+    waitQuiet: (
+      quietMs: number,
+      timeoutMs: number,
+      checkDomReady: () => Promise<boolean>
+    ): Promise<boolean> =>
+      new Promise((resolve) => {
+        const began = Date.now();
+        let done = false;
+        let quietTimer: ReturnType<typeof setTimeout> | undefined;
+        let recheckTimer: ReturnType<typeof setTimeout> | undefined;
+        let checkingDom = false;
+
+        const finish = (settled: boolean) => {
+          if (done) return;
+          done = true;
+          clearTimeout(quietTimer);
+          clearTimeout(recheckTimer);
+          clearTimeout(deadlineTimer);
+          waiters.delete(schedule);
+          resolve(settled);
+        };
+
+        const schedule = () => {
+          if (done) return;
+          clearTimeout(quietTimer);
+          quietTimer = undefined;
+          if (inFlight.size > 0) return;
+          const elapsed = Date.now() - Math.max(lastActivity, began);
+          const wait = Math.max(0, quietMs - elapsed);
+          quietTimer = setTimeout(() => {
+            quietTimer = undefined;
+            if (done || inFlight.size > 0) return;
+            if (domReady) return finish(true);
+            if (checkingDom) return;
+            checkingDom = true;
+            checkDomReady()
+              .then((ready) => {
+                checkingDom = false;
+                if (done) return;
+                if (ready) {
+                  domReady = true;
+                  if (inFlight.size === 0) finish(true);
+                } else {
+                  // Still parsing: domContentEventFired wakes schedule();
+                  // this fallback covers a probe that disabled Page events.
+                  clearTimeout(recheckTimer);
+                  recheckTimer = setTimeout(schedule, 200);
+                }
+              })
+              .catch(() => {
+                checkingDom = false;
+                if (!done) {
+                  clearTimeout(recheckTimer);
+                  recheckTimer = setTimeout(schedule, 100);
+                }
+              });
+          }, wait);
+        };
+
+        const deadlineTimer = setTimeout(() => finish(false), timeoutMs);
+        waiters.add(schedule);
+        schedule();
+      }),
     /** The HTTP status of the document a navigation loaded, by its loaderId. */
     status: (loaderId: string | undefined) =>
       loaderId === undefined ? undefined : documentStatus.get(loaderId),
